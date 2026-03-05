@@ -1,11 +1,12 @@
 package handlers
 
 import (
-    "pmic/internal/models"
-    "time"
+	"pmic/internal/models"
+	"pmic/internal/queue"
+	"time"
 
-    "github.com/gofiber/fiber/v2"
-    "gorm.io/gorm"
+	"github.com/gofiber/fiber/v2"
+	"gorm.io/gorm"
 )
 
 // RequestPayload representa el JSON que envía el cliente (RF1)
@@ -25,10 +26,11 @@ type ResponsePayload struct {
 
 type JobHandler struct {
     DB *gorm.DB
+	Queue *queue.Queue // AÑADIDO: Referencia a la cola NATS
 }
 
-func NewJobHandler(db *gorm.DB) *JobHandler {
-    return &JobHandler{DB: db}
+func NewJobHandler(db *gorm.DB, q *queue.Queue) *JobHandler {
+    return &JobHandler{DB: db, Queue: q}
 }
 
 // CreateJob maneja la recepción de la solicitud
@@ -85,9 +87,18 @@ func (h *JobHandler) CreateJob(c *fiber.Ctx) error {
             ConvertStatus:  "PENDING",
             WatermarkStatus: "PENDING",
         }
-        h.DB.Create(&image)
-        
-        // NOTA: En el Paso 3 enviaremos el mensaje a NATS aquí para iniciar la descarga.
+
+		// NOTA: En el Paso 3 enviaremos el mensaje a NATS aquí para iniciar la descarga.
+		if err := h.DB.Create(&image).Error; err == nil {
+            // AÑADIDO: Enviar a la cola de NATS (Desacoplamiento RF2)
+            taskMsg := queue.Message{
+                JobID:   job.ID,
+                ImageID: image.ID,
+                URL:     url,
+            }
+            h.Queue.Publish(queue.SubjectDownload, taskMsg)
+        }
+
     }
 
     // Retornamos el identificador del procesamiento [1]
