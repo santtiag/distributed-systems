@@ -3,6 +3,7 @@ package handlers
 import (
     "pmic/internal/models"
     "pmic/internal/queue"
+    "pmic/internal/workers"
     "time"
 
     "github.com/gofiber/fiber/v2"
@@ -23,12 +24,13 @@ type ResponsePayload struct {
 }
 
 type JobHandler struct {
-    DB       *gorm.DB
-    Pipeline *queue.PipelineChannels
+    DB         *gorm.DB
+    Pipeline   *queue.PipelineChannels
+    WorkerPool *workers.DynamicWorkerPool
 }
 
-func NewJobHandler(db *gorm.DB, p *queue.PipelineChannels) *JobHandler {
-    return &JobHandler{DB: db, Pipeline: p}
+func NewJobHandler(db *gorm.DB, p *queue.PipelineChannels, wp *workers.DynamicWorkerPool) *JobHandler {
+    return &JobHandler{DB: db, Pipeline: p, WorkerPool: wp}
 }
 
 func (h *JobHandler) CreateJob(c *fiber.Ctx) error {
@@ -41,6 +43,28 @@ func (h *JobHandler) CreateJob(c *fiber.Ctx) error {
     if len(payload.URLs) == 0 {
         return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Se requiere al menos una URL"})
     }
+
+    // Validar y establecer valores por defecto para workers
+    if payload.WorkersDownload <= 0 {
+        payload.WorkersDownload = 1
+    }
+    if payload.WorkersResize <= 0 {
+        payload.WorkersResize = 1
+    }
+    if payload.WorkersConvert <= 0 {
+        payload.WorkersConvert = 1
+    }
+    if payload.WorkersWatermark <= 0 {
+        payload.WorkersWatermark = 1
+    }
+
+    // Escalar workers dinámicamente según el payload
+    h.WorkerPool.EnsureWorkers(
+        payload.WorkersDownload,
+        payload.WorkersResize,
+        payload.WorkersConvert,
+        payload.WorkersWatermark,
+    )
 
     // Crear Job en BD
     job := models.Job{

@@ -45,7 +45,8 @@ func (w *ResizeWorker) processMessage(task queue.Message) {
     bounds := img.Bounds()
     origWidth := float64(bounds.Dx())
     origHeight := float64(bounds.Dy())
-
+	
+	// WARNING: Tener en cuenta
     targetAncho := 800.0
     targetAlto := origHeight * (targetAncho / origWidth)
     newWidthIDx := int(targetAncho)

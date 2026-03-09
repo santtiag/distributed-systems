@@ -31,57 +31,14 @@ func main() {
     pipeline := queue.NewPipeline()
     fmt.Println("✓ Pipeline Channels (Nativo) creados")
 
-    // Pool Workers de Descargas
-    for i := 1; i <= 5; i++ {
-        worker := &workers.DownloadWorker{
-            WorkerID: fmt.Sprintf("DL-Worker-%d", i),
-            DB:       db,
-            InChan:   pipeline.DownloadChan,
-            OutChan:  pipeline.ResizeChan,
-            Storage:  cfg.StoragePath,
-        }
-        worker.Start()
-    }
-
-    // Pool Workers de Redimensionamiento
-    for i := 1; i <= 3; i++ {
-        worker := &workers.ResizeWorker{
-            WorkerID: fmt.Sprintf("RSZ-Worker-%d", i),
-            DB:       db,
-            InChan:   pipeline.ResizeChan,
-            OutChan:  pipeline.ConvertChan,
-            Storage:  cfg.StoragePath,
-        }
-        worker.Start()
-    }
-
-    // Pool Workers de Conversión
-    for i := 1; i <= 3; i++ {
-        worker := &workers.ConvertWorker{
-            WorkerID: fmt.Sprintf("CNV-Worker-%d", i),
-            DB:       db,
-            InChan:   pipeline.ConvertChan,
-            OutChan:  pipeline.WatermarkChan,
-            Storage:  cfg.StoragePath,
-        }
-        worker.Start()
-    }
-
-    // Pool Workers de Marca de Agua
-    for i := 1; i <= 2; i++ {
-        worker := &workers.WatermarkWorker{
-            WorkerID: fmt.Sprintf("WMK-Worker-%d", i),
-            DB:       db,
-            InChan:   pipeline.WatermarkChan,
-            Storage:  cfg.StoragePath,
-        }
-        worker.Start()
-    }
+    // Crear el pool de workers dinámico
+    workerPool := workers.NewDynamicWorkerPool(db, cfg.StoragePath, pipeline)
+    fmt.Println("✓ Worker Pool Dinámico inicializado")
 
     app := fiber.New()
     app.Use(logger.New())
 
-    jobHandler := handlers.NewJobHandler(db, pipeline)
+    jobHandler := handlers.NewJobHandler(db, pipeline, workerPool)
 
     api := app.Group("/api/v1")
     api.Post("/process", jobHandler.CreateJob)
