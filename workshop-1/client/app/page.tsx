@@ -19,6 +19,13 @@ interface ImageMetrics {
     watermark_worker: string;
 }
 
+interface StageMetrics {
+    total_processed: number;
+    total_failed: number;
+    total_time_sec: number;
+    avg_time_sec: number;
+}
+
 interface JobData {
     job_info: {
         job_id: string;
@@ -26,6 +33,8 @@ interface JobData {
         total_files: number;
         processed_files: number;
         failed_files: number;
+        start_time: string;
+        end_time: string | null;
         images: ImageMetrics[];
     };
     global_metrics: {
@@ -33,16 +42,25 @@ interface JobData {
         total_resize_time_sec: number;
         total_convert_time_sec: number;
         total_watermark_time_sec: number;
+        total_execution_time_sec: number;
+        success_percentage: number;
+        failure_percentage: number;
+    };
+    stage_metrics: {
+        download: StageMetrics;
+        resize: StageMetrics;
+        convert: StageMetrics;
+        watermark: StageMetrics;
     };
 }
 
 export default function Home() {
     // Estados para Creación (Comando)
     const [urlsInput, setUrlsInput] = useState("");
-    const [workersDownload, setWorkersDownload] = useState(5);
-    const [workersResize, setWorkersResize] = useState(2);
-    const [workersConvert, setWorkersConvert] = useState(2);
-    const [workersWatermark, setWorkersWatermark] = useState(2);
+    const [workersDownload, setWorkersDownload] = useState(1);
+    const [workersResize, setWorkersResize] = useState(1);
+    const [workersConvert, setWorkersConvert] = useState(1);
+    const [workersWatermark, setWorkersWatermark] = useState(1);
     const [errorV, setErrorV] = useState("");
 
     // Estados para Búsqueda (Query)
@@ -139,6 +157,28 @@ export default function Home() {
             clearInterval(interval);
         };
     }, [jobId, jobData?.job_info?.status]);
+
+    const formatDateTime = (isoString: string | null) => {
+        if (!isoString) return "N/A";
+        const date = new Date(isoString);
+        return date.toLocaleString("es-ES", {
+            year: "numeric",
+            month: "2-digit",
+            day: "2-digit",
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit"
+        });
+    };
+
+    const formatDuration = (seconds: number) => {
+        if (seconds < 60) {
+            return `${seconds.toFixed(2)}s`;
+        }
+        const mins = Math.floor(seconds / 60);
+        const secs = seconds % 60;
+        return `${mins}m ${secs.toFixed(0)}s`;
+    };
 
     const renderStatusBox = (status: string) => {
         let colorClass = "bg-neutral-800 text-neutral-400 border-neutral-700";
@@ -272,6 +312,31 @@ export default function Home() {
 
                             {jobData && (
                                 <>
+                                    {/* Métricas de tiempo del job */}
+                                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4 font-mono">
+                                        <div className="border border-gray-800 bg-[#080808] p-4 text-center">
+                                            <div className="text-[10px] text-gray-600">INICIO</div>
+                                            <div className="text-sm mt-2 text-white">{formatDateTime(jobData.job_info.start_time)}</div>
+                                        </div>
+                                        <div className="border border-gray-800 bg-[#080808] p-4 text-center">
+                                            <div className="text-[10px] text-gray-600">FINALIZACION</div>
+                                            <div className="text-sm mt-2 text-white">{formatDateTime(jobData.job_info.end_time)}</div>
+                                        </div>
+                                        <div className="border border-cyan-900/30 bg-[#080808] p-4 text-center">
+                                            <div className="text-[10px] text-cyan-700">TIEMPO TOTAL</div>
+                                            <div className="text-xl mt-2 text-cyan-500">{formatDuration(jobData.global_metrics.total_execution_time_sec)}</div>
+                                        </div>
+                                        <div className="border border-purple-900/30 bg-[#080808] p-4 text-center">
+                                            <div className="text-[10px] text-purple-700">TIEMPO PROM/ARCH</div>
+                                            <div className="text-xl mt-2 text-purple-500">
+                                                {jobData.job_info.total_files > 0
+                                                    ? formatDuration(jobData.global_metrics.total_execution_time_sec / jobData.job_info.total_files)
+                                                    : "0s"}
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    {/* Métricas de archivos con porcentajes */}
                                     <div className="grid grid-cols-3 gap-4 font-mono">
                                         <div className="border border-gray-800 bg-[#080808] p-4 text-center">
                                             <div className="text-[10px] text-gray-600">ARCHIVOS TOTALES</div>
@@ -280,10 +345,112 @@ export default function Home() {
                                         <div className="border border-emerald-900/30 bg-[#080808] p-4 text-center">
                                             <div className="text-[10px] text-emerald-700">EXITOSOS</div>
                                             <div className="text-2xl mt-2 text-emerald-500">{jobData.job_info.processed_files}</div>
+                                            <div className="text-[10px] text-emerald-600 mt-1">{jobData.global_metrics.success_percentage.toFixed(1)}%</div>
                                         </div>
                                         <div className="border border-red-900/30 bg-[#080808] p-4 text-center">
                                             <div className="text-[10px] text-red-700">FALLIDOS</div>
                                             <div className="text-2xl mt-2 text-red-500">{jobData.job_info.failed_files}</div>
+                                            <div className="text-[10px] text-red-600 mt-1">{jobData.global_metrics.failure_percentage.toFixed(1)}%</div>
+                                        </div>
+                                    </div>
+
+                                    {/* Métricas por etapas */}
+                                    <div className="border-2 border-gray-800 bg-[#0a0a0a] p-4">
+                                        <div className="border-b border-gray-800 pb-2 mb-4">
+                                            <h3 className="text-[10px] font-mono text-gray-500 tracking-widest">METRICAS POR ETAPA</h3>
+                                        </div>
+                                        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                                            {/* Etapa 1: Descarga */}
+                                            <div className="border border-gray-800 bg-[#060606] p-3">
+                                                <div className="text-[10px] text-gray-500 mb-2">01 DESCARGA</div>
+                                                <div className="space-y-1">
+                                                    <div className="flex justify-between text-[9px]">
+                                                        <span className="text-gray-600">PROCESADOS:</span>
+                                                        <span className="text-white">{jobData.stage_metrics?.download?.total_processed || 0}</span>
+                                                    </div>
+                                                    <div className="flex justify-between text-[9px]">
+                                                        <span className="text-gray-600">FALLIDOS:</span>
+                                                        <span className="text-red-500">{jobData.stage_metrics?.download?.total_failed || 0}</span>
+                                                    </div>
+                                                    <div className="flex justify-between text-[9px]">
+                                                        <span className="text-gray-600">TIEMPO TOTAL:</span>
+                                                        <span className="text-cyan-500">{(jobData.stage_metrics?.download?.total_time_sec || 0).toFixed(2)}s</span>
+                                                    </div>
+                                                    <div className="flex justify-between text-[9px]">
+                                                        <span className="text-gray-600">TIEMPO PROM:</span>
+                                                        <span className="text-amber-500">{(jobData.stage_metrics?.download?.avg_time_sec || 0).toFixed(2)}s</span>
+                                                    </div>
+                                                </div>
+                                            </div>
+
+                                            {/* Etapa 2: Resize */}
+                                            <div className="border border-gray-800 bg-[#060606] p-3">
+                                                <div className="text-[10px] text-gray-500 mb-2">02 ESCALADO</div>
+                                                <div className="space-y-1">
+                                                    <div className="flex justify-between text-[9px]">
+                                                        <span className="text-gray-600">PROCESADOS:</span>
+                                                        <span className="text-white">{jobData.stage_metrics?.resize?.total_processed || 0}</span>
+                                                    </div>
+                                                    <div className="flex justify-between text-[9px]">
+                                                        <span className="text-gray-600">FALLIDOS:</span>
+                                                        <span className="text-red-500">{jobData.stage_metrics?.resize?.total_failed || 0}</span>
+                                                    </div>
+                                                    <div className="flex justify-between text-[9px]">
+                                                        <span className="text-gray-600">TIEMPO TOTAL:</span>
+                                                        <span className="text-cyan-500">{(jobData.stage_metrics?.resize?.total_time_sec || 0).toFixed(2)}s</span>
+                                                    </div>
+                                                    <div className="flex justify-between text-[9px]">
+                                                        <span className="text-gray-600">TIEMPO PROM:</span>
+                                                        <span className="text-amber-500">{(jobData.stage_metrics?.resize?.avg_time_sec || 0).toFixed(2)}s</span>
+                                                    </div>
+                                                </div>
+                                            </div>
+
+                                            {/* Etapa 3: Convert */}
+                                            <div className="border border-gray-800 bg-[#060606] p-3">
+                                                <div className="text-[10px] text-gray-500 mb-2">03 COMPRESION PNG</div>
+                                                <div className="space-y-1">
+                                                    <div className="flex justify-between text-[9px]">
+                                                        <span className="text-gray-600">PROCESADOS:</span>
+                                                        <span className="text-white">{jobData.stage_metrics?.convert?.total_processed || 0}</span>
+                                                    </div>
+                                                    <div className="flex justify-between text-[9px]">
+                                                        <span className="text-gray-600">FALLIDOS:</span>
+                                                        <span className="text-red-500">{jobData.stage_metrics?.convert?.total_failed || 0}</span>
+                                                    </div>
+                                                    <div className="flex justify-between text-[9px]">
+                                                        <span className="text-gray-600">TIEMPO TOTAL:</span>
+                                                        <span className="text-cyan-500">{(jobData.stage_metrics?.convert?.total_time_sec || 0).toFixed(2)}s</span>
+                                                    </div>
+                                                    <div className="flex justify-between text-[9px]">
+                                                        <span className="text-gray-600">TIEMPO PROM:</span>
+                                                        <span className="text-amber-500">{(jobData.stage_metrics?.convert?.avg_time_sec || 0).toFixed(2)}s</span>
+                                                    </div>
+                                                </div>
+                                            </div>
+
+                                            {/* Etapa 4: Watermark */}
+                                            <div className="border border-gray-800 bg-[#060606] p-3">
+                                                <div className="text-[10px] text-gray-500 mb-2">04 WATERMARK</div>
+                                                <div className="space-y-1">
+                                                    <div className="flex justify-between text-[9px]">
+                                                        <span className="text-gray-600">PROCESADOS:</span>
+                                                        <span className="text-white">{jobData.stage_metrics?.watermark?.total_processed || 0}</span>
+                                                    </div>
+                                                    <div className="flex justify-between text-[9px]">
+                                                        <span className="text-gray-600">FALLIDOS:</span>
+                                                        <span className="text-red-500">{jobData.stage_metrics?.watermark?.total_failed || 0}</span>
+                                                    </div>
+                                                    <div className="flex justify-between text-[9px]">
+                                                        <span className="text-gray-600">TIEMPO TOTAL:</span>
+                                                        <span className="text-cyan-500">{(jobData.stage_metrics?.watermark?.total_time_sec || 0).toFixed(2)}s</span>
+                                                    </div>
+                                                    <div className="flex justify-between text-[9px]">
+                                                        <span className="text-gray-600">TIEMPO PROM:</span>
+                                                        <span className="text-amber-500">{(jobData.stage_metrics?.watermark?.avg_time_sec || 0).toFixed(2)}s</span>
+                                                    </div>
+                                                </div>
+                                            </div>
                                         </div>
                                     </div>
 

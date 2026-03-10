@@ -1,526 +1,612 @@
 # PMIC - Plataforma de Procesamiento Masivo de Imágenes Concurrente
 
-## Descripción General
+## Arquitectura de Software
 
-PMIC es un sistema backend basado en API REST que implementa un modelo de procesamiento concurrente para la descarga y transformación masiva de imágenes. El sistema utiliza el patrón Productor-Consumidor con colas de mensajes para desacoplar las diferentes etapas de procesamiento.
+Este documento describe la arquitectura de software del proyecto PMIC, una plataforma de procesamiento masivo de imágenes que implementa el patrón Productor-Consumidor utilizando las primitivas de concurrencia de Go (goroutines y channels).
 
 ---
 
-## Arquitectura Visual del Sistema
+## 1. Visión General de la Arquitectura
+
+El sistema está compuesto por dos servicios principales:
+
+| Servicio | Puerto | Responsabilidad |
+|----------|--------|-----------------|
+| **pmic** | 5000 | Servicio de procesamiento de imágenes. Expone API REST para crear jobs y ejecuta el pipeline concurrente de procesamiento. |
+| **pmic-query** | 3001 | Servicio de consulta de estado. Proporciona endpoints REST para consultar el estado y métricas de los jobs de procesamiento. |
+
+### Arquitectura de Alto Nivel
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                                    CLIENTE                                          │
-│                              (Frontend/Postman/cURL)                                │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-                                          │
-                                          │ HTTP POST /api/v1/process
-                                          │ JSON: {urls[], workers_config}
-                                          ▼
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                           CAPA API REST (FIBER)                                     │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
-│  │                         JobHandler (cmd/main.go:108)                        │   │
-│  │  • Recibe solicitud (RF1)                                                   │   │
-│  │  • Crea Job en PostgreSQL                                                   │   │
-│  │  • Crea registros Image                                                     │   │
-│  │  • Publica mensajes en NATS (images.download)                                 │   │
-│  │  • Retorna job_id                                                           │   │
-│  └─────────────────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-                                          │
-                                          │ Mensajes: {job_id, image_id, url}
-                                          ▼
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                      SISTEMA DE MENSAJERÍA NATS (Queue)                             │
-│                                                                                     │
-│   ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐           │
-│   │  images.download │───▶│   images.resize  │───▶│  images.convert  │───▶ ...     │
-│   │   (Cola RF2)     │    │   (Cola RF3)     │    │   (Cola RF4)     │            │
-│   └──────────────────┘    └──────────────────┘    └──────────────────┘           │
-│                                                                                     │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-                    │                  │                  │
-                    ▼                  ▼                  ▼
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                         CAPA DE WORKERS CONCURRENTES                                │
-│                                                                                     │
-│   ┌─────────────────────────┐                                                       │
-│   │    DOWNLOAD WORKERS     │  ◄── IO-Bound (Red/HTTP)                              │
-│   │    (5 instancias)       │      • Descarga desde URLs                             │
-│   │    download_worker.go   │      • Almacena en disco                               │
-│   │                         │      • Métricas: tamaño, tiempo                        │
-│   │  DL-Worker-1  DL-Worker-2  ...  DL-Worker-5                                    │
-│   └─────────────────────────┘                                                       │
-│              │                                                                      │
-│              ▼                                                                      │
-│   ┌─────────────────────────┐                                                       │
-│   │     RESIZE WORKERS      │  ◄── CPU-Bound (Procesamiento)                        │
-│   │     (3 instancias)      │      • Redimensiona a 800px                          │
-│   │     resize_worker.go     │      • Algoritmo Lanczos                             │
-│   │                         │      • Mantiene proporción                             │
-│   │  RSZ-Worker-1  RSZ-Worker-2  RSZ-Worker-3                                       │
-│   └─────────────────────────┘                                                       │
-│              │                                                                      │
-│              ▼                                                                      │
-│   ┌─────────────────────────┐                                                       │
-│   │     CONVERT WORKERS     │  ◄── CPU-Bound Pesado                                 │
-│   │     (3 instancias)      │      • Conversión a PNG                                │
-│   │     convert_worker.go   │      • Compresión sin pérdida                          │
-│   │                         │                                                       │
-│   │  CNV-Worker-1  CNV-Worker-2  CNV-Worker-3                                       │
-│   └─────────────────────────┘                                                       │
-│              │                                                                      │
-│              ▼                                                                      │
-│   ┌─────────────────────────┐                                                       │
-│   │    WATERMARK WORKERS    │  ◄── CPU-Bound (Gráficos)                             │
-│   │     (2 instancias)      │      • Banner negro semi-transparente                 │
-│   │    watermark_worker.go  │      • Texto "WATERMARK - PMIC"                      │
-│   │                         │      • Actualiza estado final Job                      │
-│   │  WMK-Worker-1  WMK-Worker-2                                                    │
-│   └─────────────────────────┘                                                       │
-│                                                                                     │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-                    │
-                    │ Lectura/Escritura
-                    ▼
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                    BASE DE DATOS POSTGRESQL (GORM)                                  │
-│                                                                                     │
-│   ┌──────────────────────────┐        ┌─────────────────────────────────────────┐    │
-│   │        jobs              │        │              images                   │    │
-│   │  ┌────────────────────┐  │        │  ┌─────────────────────────────────┐   │    │
-│   │  │ id (UUID) PK       │──┼────────┼──┤ job_id FK                       │   │    │
-│   │  │ status             │  │        │  │ id (UUID) PK                    │   │    │
-│   │  │ total_files        │  │        │  │ original_url                    │   │    │
-│   │  │ processed_files    │  │        │  │ file_name                       │   │    │
-│   │  │ failed_files       │  │        │  │                                 │   │    │
-│   │  │ start_time         │  │        │  │ download_status                 │   │    │
-│   │  │ end_time           │  │        │  │ download_path                   │   │    │
-│   │  │                    │  │        │  │ download_size_mb                │   │    │
-│   │  │ workers_download   │  │        │  │ download_time_sec               │   │    │
-│   │  │ workers_resize     │  │        │  │ download_worker_id              │   │    │
-│   │  │ workers_convert    │  │        │  │                                 │   │    │
-│   │  │ workers_watermark  │  │        │  │ resize_status                   │   │    │
-│   │  └────────────────────┘  │        │  │ resize_path                     │   │    │
-│   │                          │        │  │ resize_time_sec                 │   │    │
-│   │                          │        │  │ resize_worker_id                │   │    │
-│   │                          │        │  │ original_width/height           │   │    │
-│   │                          │        │  │ new_width/height                │   │    │
-│   │                          │        │  │                                 │   │    │
-│   │                          │        │  │ convert_status                  │   │    │
-│   │                          │        │  │ convert_path                    │   │    │
-│   │                          │        │  │ convert_time_sec                │   │    │
-│   │                          │        │  │ convert_worker_id               │   │    │
-│   │                          │        │  │                                 │   │    │
-│   │                          │        │  │ watermark_status                │   │    │
-│   │                          │        │  │ watermark_path                  │   │    │
-│   │                          │        │  │ watermark_time_sec              │   │    │
-│   │                          │        │  │ watermark_worker_id             │   │    │
-│   │                          │        │  │                                 │   │    │
-│   │                          │        │  │ error_message                   │   │    │
-│   │                          │        │  └─────────────────────────────────┘   │    │
-│   │                          │        └─────────────────────────────────────────┘    │
-│   └──────────────────────────┘                                                       │
-│                                                                                     │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-                                          │
-                                          ▼
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                              ALMACENAMIENTO LOCAL                                   │
-│                              (Directorio storage/)                                  │
-│                                                                                     │
-│   Formato de archivos generados:                                                    │
-│   • {uuid}_original.jpg          - Archivo descargado original                        │
-│   • {uuid}_redimensionado.jpg    - Imagen redimensionada (800px ancho)                │
-│   • {uuid}_formato_cambiado.png - Conversión a formato PNG                          │
-│   • {uuid}_marca_agua.png        - Versión final con watermark                      │
-│                                                                                     │
-└─────────────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              CLIENTE (FRONTEND)                             │
+└───────────────────────────────┬─────────────────────────────────────────────┘
+                                │ HTTP
+                                ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              LAYER DE API                                   │
+│  ┌─────────────────┐                          ┌─────────────────────────┐   │
+│  │  pmic:5000      │                          │  pmic-query:3001       │   │
+│  │  POST /process  │                          │  GET /status/:job_id   │   │
+│  └────────┬────────┘                          └───────────┬─────────────┘   │
+└───────────┼───────────────────────────────────────────────────┼─────────────────┘
+            │                                                  │
+            │ ESCRITURA                                       │ LECTURA
+            ▼                                                  ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           BASE DE DATOS                                     │
+│                      PostgreSQL (DATABASE_URL)                               │
+│                                                                             │
+│  ┌─────────────────────┐          ┌─────────────────────────────────────────┐ │
+│  │  Tabla: jobs       │          │  Tabla: images                          │ │
+│  │  - id (UUID)       │◄────────►│  - id (UUID)                            │ │
+│  │  - status          │   1:N    │  - job_id (FK)                          │ │
+│  │  - total_files     │          │  - original_url                         │ │
+│  │  - processed_files │          │  - download/resize/convert/watermark   │ │
+│  │  - start/end_time  │          │    _status, _path, _time_sec,           │ │
+│  │  - workers_*       │          │    _worker_id                           │ │
+│  └─────────────────────┘          └─────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Flujo de Datos del Pipeline
+## 2. Arquitectura del Servicio `pmic`
 
-```
-┌─────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│ Cliente │────▶│  Descarga   │────▶│  Resize     │────▶│  Convert    │────▶│  Watermark  │
-│   POST  │     │  (IO-Bound) │     │ (CPU-Bound) │     │(CPU-Bound)  │     │(CPU-Bound)  │
-└─────────┘     └─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
-     │                │                  │                  │                  │
-     │           PENDING ──►         PENDING ──►         PENDING ──►         PENDING
-     │          PROCESSING           PROCESSING          PROCESSING          PROCESSING
-     │          COMPLETED            COMPLETED           COMPLETED           COMPLETED
-     │                │                  │                  │                  │
-     │           images.download    images.resize      images.convert    images.watermark
-     │           (NATS subject)     (NATS subject)     (NATS subject)    (NATS subject)
-```
+El servicio `pmic` implementa un **pipeline de procesamiento concurrente** utilizando canales de Go (channels) como mecanismo de colas entre etapas.
 
----
-
-## Descripción de Componentes
-
-### 1. Capa API REST (`internal/handlers/`)
-
-**JobHandler** (`job_handler.go`)
-- **Endpoint**: `POST /api/v1/process`
-- **Responsabilidades**:
-  - Recibe payload JSON con URLs y configuración de workers
-  - Valida datos de entrada
-  - Crea registro Job en PostgreSQL con estado `EN_PROCESO`
-  - Crea registros Image para cada URL con estado `PENDING`
-  - Publica mensajes en NATS subject `images.download`
-  - Retorna `job_id` para consulta posterior
-
-**Estructura del Payload de Entrada**:
-```json
-{
-  "urls": ["https://ejemplo.com/img1.jpg", "https://ejemplo.com/img2.png"],
-  "workers_download": 5,
-  "workers_resize": 3,
-  "workers_convert": 3,
-  "workers_watermark": 2
-}
-```
-
-### 2. Sistema de Colas NATS (`internal/queue/`)
-
-**Queue** (`nats.go`)
-- **Propósito**: Desacoplamiento asincrónico entre etapas del pipeline
-- **Subjects (Topics)**:
-  - `images.download`: Cola para descargas concurrentes
-  - `images.resize`: Cola para redimensionamiento
-  - `images.convert`: Cola para conversión de formato
-  - `images.watermark`: Cola para marca de agua
-
-**Patrón**: Competitive Consumers (Consumidores Competitivos)
-- Múltiples workers suscritos al mismo subject
-- NATS distribuye mensajes usando round-robin
-- Permite escalado horizontal de workers
-
-**Estructura del Mensaje**:
-```go
-type Message struct {
-    JobID      string  // ID del job padre
-    ImageID    string  // ID de la imagen específica
-    InputPath  string  // Path del archivo de entrada
-    OutputPath string  // Path del archivo de salida
-    URL        string  // URL original (solo para descarga)
-    FileName   string  // Nombre base del archivo
-}
-```
-
-### 3. Workers Concurrentes (`internal/workers/`)
-
-Cada worker implementa la interfaz:
-```go
-type Worker interface {
-    Start() error
-    processMessage(msg *nats.Msg)
-    marcarFallo(...)
-}
-```
-
-#### 3.1 DownloadWorker (`download_worker.go`)
-- **Tipo**: IO-Bound (Operaciones de red)
-- **Cantidad**: 5 instancias (`DL-Worker-1` a `DL-Worker-5`)
-- **Funciones**:
-  - Descarga imagen desde URL vía HTTP GET
-  - Determina extensión desde Content-Type
-  - Guarda archivo como `{uuid}_original.{ext}`
-  - Calcula: tamaño en MB, tiempo de descarga
-  - Actualiza BD: status, path, métricas, worker_id
-  - Publica siguiente mensaje a `images.resize`
-
-**Métricas RF2 Almacenadas**:
-- `download_size_mb`: Tamaño en megabytes
-- `download_time_sec`: Tiempo transcurrido
-- `download_worker_id`: Identificador del worker
-- `downloaded_at`: Timestamp
-
-#### 3.2 ResizeWorker (`resize_worker.go`)
-- **Tipo**: CPU-Bound (Procesamiento de imagen)
-- **Cantidad**: 3 instancias (`RSZ-Worker-1` a `RSZ-Worker-3`)
-- **Funciones**:
-  - Carga imagen original con `imaging.Open()`
-  - Calcula nuevas dimensiones: `nuevo_alto = alto_original * (800 / ancho_original)`
-  - Redimensiona usando algoritmo Lanczos
-  - Guarda como `{uuid}_redimensionado.{ext}`
-  - Almacena dimensiones originales y nuevas
-
-**Fórmula de Redimensionamiento RF3**:
-```
-nuevo_ancho = 800px (fijo)
-nuevo_alto = alto_original * (nuevo_ancho / ancho_original)
-```
-
-#### 3.3 ConvertWorker (`convert_worker.go`)
-- **Tipo**: CPU-Bound Pesado (Compresión)
-- **Cantidad**: 3 instancias (`CNV-Worker-1` a `CNV-Worker-3`)
-- **Funciones**:
-  - Convierte imagen a formato PNG
-  - Usa encoder PNG de `imaging.Save()`
-  - Guarda como `{uuid}_formato_cambiado.png`
-  - Nota: Potencial cuello de botella por compresión
-
-#### 3.4 WatermarkWorker (`watermark_worker.go`)
-- **Tipo**: CPU-Bound (Gráficos/Renderizado)
-- **Cantidad**: 2 instancias (`WMK-Worker-1`, `WMK-Worker-2`)
-- **Funciones**:
-  - Carga imagen PNG con `imaging.Open()`
-  - Crea contexto de dibujo con `gg.NewContextForImage()`
-  - Dibuja banner negro semi-transparente (y=height-50, alto=50px)
-  - Escribe texto "WATERMARK - PMIC" en blanco centrado
-  - Guarda como `{uuid}_marca_agua.png`
-  - **Actualiza contador del Job** y verifica finalización
-
-**Lógica de Cierre**:
-```go
-if job.ProcessedFiles + job.FailedFiles >= job.TotalFiles {
-    // Marcar Job como COMPLETADO o COMPLETADO_CON_ERRORES
-    // Guardar end_time
-}
-```
-
-### 4. Base de Datos PostgreSQL (`internal/database/`, `internal/models/`)
-
-**Conexión** (`database.go`):
-- ORM: GORM (v2)
-- Driver: `gorm.io/driver/postgres`
-- Auto-migración de esquemas al iniciar
-- URL configurable vía variable de entorno `DATABASE_URL`
-
-#### Modelo Job (`models/models.go:18-38`)
-Representa un procesamiento completo:
-
-| Campo | Tipo | Descripción |
-|-------|------|-------------|
-| `id` | UUID PK | Identificador único del job |
-| `status` | VARCHAR | EN_PROCESO, COMPLETADO, COMPLETADO_CON_ERRORES, FALLIDO |
-| `total_files` | INT | Total de imágenes a procesar |
-| `processed_files` | INT | Contador de completadas exitosamente |
-| `failed_files` | INT | Contador de fallos |
-| `start_time` | TIMESTAMP | Inicio del procesamiento |
-| `end_time` | TIMESTAMP | Finalización (nullable) |
-| `workers_*` | INT | Configuración de workers por etapa |
-
-#### Modelo Image (`models/models.go:41-84`)
-Representa cada imagen en el pipeline:
-
-**Estados por Etapa**:
-- `download_status`: PENDING → PROCESSING → COMPLETED/FAILED
-- `resize_status`: PENDING → PROCESSING → COMPLETED/FAILED
-- `convert_status`: PENDING → PROCESSING → COMPLETED/FAILED
-- `watermark_status`: PENDING → PROCESSING → COMPLETED/FAILED
-
-**Metadatos por Etapa**:
-- Paths de archivos generados
-- Tiempos de procesamiento (segundos)
-- Identificadores de workers
-- Dimensiones originales y nuevas (resize)
-- Mensaje de error (si aplica)
-
----
-
-## Patrones de Diseño Implementados
-
-### 1. Productor-Consumidor
-- **Productor**: JobHandler publica mensajes en NATS
-- **Colas**: Subjects NATS actúan como buffers
-- **Consumidores**: Workers que procesan mensajes concurrentemente
-
-### 2. Pipeline de Procesamiento
-- Las imágenes fluyen secuencialmente por 4 etapas
-- Cada etapa publica en la siguiente cola al completarse
-- Desacoplamiento total entre etapas
-
-### 3. Competitive Consumers
-- Múltiples workers por etapa compiten por mensajes
-- NATS distribuye mensajes usando round-robin
-- Escalado horizontal por etapa
-
-### 4. Event-Driven Architecture
-- Comunicación asíncrona vía mensajes
-- Workers reactivos a eventos de la cola
-- Actualizaciones de estado reactivas
-
----
-
-## Tipos de Operaciones y Cuellos de Botella
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    CLASIFICACIÓN POR ETAPA                       │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│   DESCARGA (DownloadWorker)                                      │
-│   ━━━━━━━━━━━━━━━━━━━━━━━━━                                      │
-│   Tipo: IO-Bound                                                 │
-│   Recursos: Red HTTP, Disco                                      │
-│   Workers: 5 (más workers = más concurrencia de red)             │
-│   Cuello: Ancho de banda de red                                  │
-│                                                                  │
-│   REDIMENSIONAMIENTO (ResizeWorker)                              │
-│   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                              │
-│   Tipo: CPU-Bound                                                │
-│   Recursos: CPU (algoritmo Lanczos matemático)                  │
-│   Workers: 3 (recomendado: núcleos físicos del CPU)              │
-│   Cuello: Capacidad de cómputo                                   │
-│                                                                  │
-│   CONVERSIÓN (ConvertWorker)                                     │
-│   ━━━━━━━━━━━━━━━━━━━━━━━━━━                                    │
-│   Tipo: CPU-Bound Pesado                                         │
-│   Recursos: CPU (compresión PNG sin pérdida)                     │
-│   Workers: 3                                                     │
-│   Cuello: Principal cuello de botella del sistema                │
-│                                                                  │
-│   MARCA DE AGUA (WatermarkWorker)                                │
-│   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                │
-│   Tipo: CPU-Bound (Gráficos)                                     │
-│   Recursos: CPU (renderizado con gg)                           │
-│   Workers: 2                                                     │
-│   Cuello: Capacidad de renderizado                               │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Secuencia de Ejecución
-
-```
-1. INICIALIZACIÓN (cmd/main.go)
-   ├─ Crear directorio storage/
-   ├─ Conectar PostgreSQL
-   ├─ Conectar NATS
-   ├─ Iniciar 5 DownloadWorkers
-   ├─ Iniciar 3 ResizeWorkers
-   ├─ Iniciar 3 ConvertWorkers
-   ├─ Iniciar 2 WatermarkWorkers
-   └─ Iniciar servidor Fiber en :5000
-
-2. RECEPCIÓN DE SOLICITUD (RF1)
-   ├─ POST /api/v1/process
-   ├─ Validar payload
-   ├─ Crear Job en BD (status: EN_PROCESO)
-   ├─ Crear registros Image (status: PENDING)
-   ├─ Publicar mensajes en images.download
-   └─ Responder: {job_id, message}
-
-3. PIPELINE DE PROCESAMIENTO
-   Para cada imagen:
-   ├─ ETAPA 2 (RF2): Descarga
-   │   ├─ Recibir mensaje images.download
-   │   ├─ Descargar vía HTTP
-   │   ├─ Guardar archivo
-   │   ├─ Actualizar BD con métricas
-   │   └─ Publicar mensaje images.resize
-   │
-   ├─ ETAPA 3 (RF3): Redimensionamiento
-   │   ├─ Recibir mensaje images.resize
-   │   ├─ Calcular nuevas dimensiones (800px)
-   │   ├─ Aplicar algoritmo Lanczos
-   │   ├─ Guardar archivo
-   │   ├─ Actualizar BD con métricas
-   │   └─ Publicar mensaje images.convert
-   │
-   ├─ ETAPA 4 (RF4): Conversión
-   │   ├─ Recibir mensaje images.convert
-   │   ├─ Convertir a formato PNG
-   │   ├─ Guardar archivo
-   │   ├─ Actualizar BD con métricas
-   │   └─ Publicar mensaje images.watermark
-   │
-   └─ ETAPA 5 (RF5): Marca de Agua
-       ├─ Recibir mensaje images.watermark
-       ├─ Dibujar banner + texto
-       ├─ Guardar archivo final
-       ├─ Actualizar BD con métricas
-       └─ Actualizar contador Job y verificar fin
-
-4. FINALIZACIÓN
-   └─ Cuando ProcessedFiles + FailedFiles == TotalFiles
-       ├─ Marcar Job como COMPLETADO o COMPLETADO_CON_ERRORES
-       └─ Guardar end_time
-```
-
----
-
-## Estructura del Proyecto
+### 2.1 Estructura del Proyecto
 
 ```
 pmic/
 ├── cmd/
-│   └── main.go                    # Punto de entrada, inicialización
+│   └── main.go                    # Punto de entrada, orquestación de componentes
 ├── internal/
 │   ├── config/
-│   │   └── config.go              # Variables de entorno
+│   │   └── config.go              # Gestión de configuración (env vars)
 │   ├── database/
-│   │   └── database.go            # Conexión PostgreSQL + GORM
-│   ├── handlers/
-│   │   └── job_handler.go         # Handler REST (RF1)
+│   │   └── database.go            # Conexión y migraciones PostgreSQL (GORM)
 │   ├── models/
-│   │   └── models.go              # Job, Image (estructuras BD)
+│   │   └── models.go              # Modelos de datos: Job e Image
 │   ├── queue/
-│   │   └── nats.go                # Cliente NATS, mensajes
+│   │   └── queue.go               # Definición de canales del pipeline
+│   ├── handlers/
+│   │   └── job_handler.go         # Handlers HTTP (API REST)
 │   └── workers/
-│       ├── download_worker.go     # Worker de descarga (RF2)
-│       ├── resize_worker.go       # Worker redimensionamiento (RF3)
-│       ├── convert_worker.go      # Worker conversión (RF4)
-│       └── watermark_worker.go    # Worker marca de agua (RF5)
-├── storage/                       # Directorio de imágenes generadas
-├── tmp/                           # Archivos temporales
-├── go.mod                         # Dependencias Go
-├── go.sum                         # Checksums
-└── README.md                      # Este documento
+│       ├── download_worker.go     # Workers de descarga (IO-bound)
+│       ├── resize_worker.go       # Workers de redimensionamiento (CPU-bound)
+│       ├── convert_worker.go      # Workers de conversión de formato (CPU-bound)
+│       └── watermark_worker.go    # Workers de marca de agua (CPU-bound)
+└── storage/                        # Almacenamiento local de imágenes
+```
+
+### 2.2 Pipeline de Procesamiento Paralelo
+
+El sistema implementa un **pipeline de 4 etapas** donde las últimas 3 etapas trabajan **en paralelo e independientemente**, leyendo todas directamente desde la imagen original en la base de datos:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      PIPELINE DE PROCESAMIENTO PARALELO                       │
+│                                                                             │
+│   ┌─────────────┐                                                           │
+│   │   Request   │  POST /api/v1/process                                     │
+│   │   HTTP      │  {urls: [...], workers_download: N, ...}                  │
+│   └──────┬──────┘                                                           │
+│          │                                                                  │
+│          ▼                                                                  │
+│   ┌─────────────┐    ┌─────────────────────────────────────────────────────┐  │
+│   │  Creación  │    │  Base de Datos (PostgreSQL)                         │  │
+│   │  de Job    │───►│  - INSERT INTO jobs (id, status, total_files...)   │  │
+│   │            │    │  - INSERT INTO images (job_id, original_url...)     │  │
+│   └──────┬──────┘    └─────────────────────────────────────────────────────┘  │
+│          │                                                                  │
+│          ▼                                                                  │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │     DISTRIBUCIÓN PARALELA A TODAS LAS COLAS (mismo mensaje)        │   │
+│   │                                                                     │   │
+│   │  ┌─────────────────────────────────────────────────────────────┐   │   │
+│   │  │  for each image:                                            │   │   │
+│   │  │    DownloadChan  <- msg  ─────────────────────────────┐     │   │   │
+│   │  │    ResizeChan    <- msg  ─────────────────────────────┼──┐  │   │   │
+│   │  │    ConvertChan   <- msg  ─────────────────────────────┼──┼──┐  │   │   │
+│   │  │    WatermarkChan <- msg  ─────────────────────────────┼──┼──┼──┐  │   │   │
+│   │  │                                                       │  │  │  │  │   │   │
+│   │  └───────────────────────────────────────────────────────┼──┼──┼──┘  │   │   │
+│   │                                                      ▼  ▼  ▼  ▼   │   │
+│   │              CADA COLA ES INDEPENDIENTE - NO HAY CADENAS           │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                 WORKERS (GOROUTINES) - EJECUCIÓN PARALELA          │   │
+│   │                                                                     │   │
+│   │  ┌─────────────────────────────────────────────────────────────┐   │   │
+│   │  │           POOL DE DOWNLOAD WORKERS (N configurables)          │   │   │
+│   │  │  ┌─────────┐  ┌─────────┐  ┌─────────┐                       │   │   │
+│   │  │  │Worker 1 │  │Worker 2 │  │Worker N │  ...                    │   │   │
+│   │  │  └────┬────┘  └────┬────┘  └────┬────┘                       │   │   │
+│   │  │       └────────────┴────────────┘                            │   │   │
+│   │  │                    │                                          │   │   │
+│   │  │         for msg := range DownloadChan                        │   │   │
+│   │  │                    │                                          │   │   │
+│   │  │  Proceso: 1. Descargar imagen desde URL                     │   │   │
+│   │  │           2. Guardar en disco (_original)                     │   │   │
+│   │  │           3. Actualizar DB (download_path, tiempo, etc)       │   │   │
+│   │  │           [NO envía a siguiente cola - trabajan en paralelo] │   │   │
+│   │  └───────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                     │   │
+│   │  ┌─────────────────────────────────────────────────────────────┐   │   │
+│   │  │           POOL DE RESIZE WORKERS (N configurables)            │   │   │
+│   │  │                    │                                          │   │   │
+│   │  │         for msg := range ResizeChan                          │   │   │
+│   │  │                    │                                          │   │   │
+│   │  │  Proceso: 1. Leer download_path desde DB (esperar si PENDING)│   │   │
+│   │  │           2. Abrir imagen ORIGINAL desde download_path      │   │   │
+│   │  │           3. Redimensionar a 800px (manteniendo proporción) │   │   │
+│   │  │           4. Guardar _redimensionado                          │   │   │
+│   │  │           5. Actualizar DB (resize_path, etc)                 │   │   │
+│   │  │           [LEE DIRECTO DE DB - NO depende de download]      │   │   │
+│   │  └───────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                     │   │
+│   │  ┌─────────────────────────────────────────────────────────────┐   │   │
+│   │  │           POOL DE CONVERT WORKERS (N configurables)           │   │   │
+│   │  │                    │                                          │   │   │
+│   │  │         for msg := range ConvertChan                         │   │   │
+│   │  │                    │                                          │   │   │
+│   │  │  Proceso: 1. Leer download_path desde DB (esperar si PENDING)│   │   │
+│   │  │           2. Abrir imagen ORIGINAL desde download_path      │   │   │
+│   │  │           3. Convertir a PNG                                  │   │   │
+│   │  │           4. Guardar _formato_cambiado                      │   │   │
+│   │  │           5. Actualizar DB (convert_path, etc)              │   │   │
+│   │  │           [LEE DIRECTO DE DB - NO depende de resize]        │   │   │
+│   │  └───────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                     │   │
+│   │  ┌─────────────────────────────────────────────────────────────┐   │   │
+│   │  │          POOL DE WATERMARK WORKERS (N configurables)           │   │   │
+│   │  │                    │                                          │   │   │
+│   │  │         for msg := range WatermarkChan                       │   │   │
+│   │  │                    │                                          │   │   │
+│   │  │  Proceso: 1. Leer download_path desde DB (esperar si PENDING)│   │   │
+│   │  │           2. Abrir imagen ORIGINAL desde download_path      │   │   │
+│   │  │           3. Aplicar marca de agua                          │   │   │
+│   │  │           4. Guardar _marca_agua                            │   │   │
+│   │  │           5. Actualizar DB (watermark_path, etc)            │   │   │
+│   │  │           6. Verificar si Job completado                    │   │   │
+│   │  │           [LEE DIRECTO DE DB - NO depende de convert]       │   │   │
+│   │  └───────────────────────────────────────────────────────────────┘   │   │
+│   └───────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                    FLUJO DE DATOS                                   │   │
+│   │                                                                     │   │
+│   │  Resize ──► Lee download_path de DB ──► Procesa imagen original    │   │
+│   │  Convert ─► Lee download_path de DB ──► Procesa imagen original   │   │
+│   │  Watermark ► Lee download_path de DB ► Procesa imagen original     │   │
+│   │                                                                     │   │
+│   │  Cada worker consulta la DB periódicamente hasta que:             │   │
+│   │  - download_status = "COMPLETADO" → Procesa                       │   │
+│   │  - download_status = "FALLIDO"    → Marca fallo y termina         │   │
+│   │                                                                     │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.3 Patrones de Concurrencia Implementados
+
+#### 2.3.1 Worker Pool (Fan-Out)
+
+Cada etapa del pipeline tiene un pool de workers que leen del mismo canal. Esto permite procesar múltiples tareas en paralelo:
+
+```go
+// Creación de workers en main.go
+for i := 0; i < config.WorkersDownload; i++ {
+    worker := workers.NewDownloadWorker(
+        fmt.Sprintf("download-worker-%d", i),
+        db,
+        pipeline.DownloadChan,
+        pipeline.ResizeChan,
+        storagePath,
+    )
+    worker.Start() // Inicia goroutine por cada worker
+}
+```
+
+#### 2.3.2 Patrón de Procesamiento Paralelo
+
+Los workers de cada etapa (resize, convert, watermark) leen independientemente de la base de datos. No hay conexión directa entre las colas - cada worker espera a que la descarga esté completada consultando la DB:
+
+```go
+// DownloadWorker: Solo descarga y guarda en DB
+func (w *DownloadWorker) Start() {
+    go func() {
+        for msg := range w.InChan {
+            err := w.process(msg)
+            if err != nil {
+                w.handleError(msg, err)
+            }
+            // NO envía a siguiente cola - las demás colas ya recibieron el msg
+        }
+    }()
+}
+
+// ResizeWorker, ConvertWorker, WatermarkWorker: Leen de DB directamente
+func (w *ResizeWorker) Start() {
+    go func() {
+        for msg := range w.InChan {
+            // 1. Consultar DB hasta que download_status = "COMPLETADO"
+            image := w.waitForDownload(msg.ImageID)
+            // 2. Procesar desde image.DownloadPath (imagen original)
+            result, err := w.process(image)
+            // 3. Guardar resultado en DB
+            // NO envía a siguiente cola
+        }
+    }()
+}
+```
+
+#### 2.3.3 Buffered Channels
+
+Los canales tienen un buffer de 1000 mensajes para evitar bloqueos cuando los workers están ocupados:
+
+```go
+// internal/queue/queue.go
+func NewPipeline() *PipelineChannels {
+    return &PipelineChannels{
+        DownloadChan:  make(chan Message, 1000),
+        ResizeChan:    make(chan Message, 1000),
+        ConvertChan:   make(chan Message, 1000),
+        WatermarkChan: make(chan Message, 1000),
+    }
+}
+```
+
+### 2.4 Flujo de Datos
+
+```go
+// Estructura del mensaje que viaja por las colas
+// internal/queue/queue.go
+type Message struct {
+    JobID   string  // UUID del job padre
+    ImageID string  // UUID de la imagen específica
+    URL     string  // URL original de la imagen (solo para download)
+}
+
+// NOTA: Los workers de resize, convert y watermark obtienen
+// el download_path directamente de la base de datos, no del mensaje.
+// Esto permite que procesen en paralelo desde la imagen original.
+```
+
+### 2.5 Tipos de Workers
+
+#### Download Worker (IO-Bound)
+
+- **Tipo:** IO-bound (espera respuesta de red)
+- **Responsabilidad:** Descargar imágenes desde URLs HTTP
+- **Métricas guardadas:** Tamaño en MB, tiempo de descarga, worker ID
+
+```go
+func (w *DownloadWorker) process(msg Message) (Message, error) {
+    // 1. HTTP GET a la URL
+    // 2. Determinar extensión desde Content-Type
+    // 3. Guardar en storage/{uuid}_original.{ext}
+    // 4. Actualizar DB: download_path, download_time_sec, download_worker_id
+    // 5. Retornar msg para siguiente etapa
+}
+```
+
+#### Resize Worker (CPU-Bound)
+
+- **Tipo:** CPU-bound (procesamiento de imagen)
+- **Responsabilidad:** Redimensionar a 800px de ancho manteniendo proporción, **trabaja directamente desde la imagen original**
+- **Métricas guardadas:** Tiempo de procesamiento, worker ID
+
+```go
+func (w *ResizeWorker) process(msg Message) error {
+    // 1. Consultar DB: SELECT download_path, download_status FROM images WHERE id = ?
+    // 2. Esperar polling hasta que download_status = "COMPLETADO"
+    // 3. Abrir imagen ORIGINAL desde download_path (no de entrada anterior)
+    // 4. Calcular nueva altura: newHeight = (originalHeight * 800) / originalWidth
+    // 5. Aplicar Lanczos resampling
+    // 6. Guardar en storage/{uuid}_redimensionado.{ext}
+    // 7. Actualizar DB: resize_path, resize_time_sec, resize_worker_id
+    // [NO envía a siguiente etapa - trabaja independientemente]
+}
+```
+
+#### Convert Worker (CPU-Bound)
+
+- **Tipo:** CPU-bound (codificación de imagen)
+- **Responsabilidad:** Convertir a formato PNG, **trabaja directamente desde la imagen original**
+- **Métricas guardadas:** Tiempo de procesamiento, worker ID
+
+```go
+func (w *ConvertWorker) process(msg Message) error {
+    // 1. Consultar DB: SELECT download_path, download_status FROM images WHERE id = ?
+    // 2. Esperar polling hasta que download_status = "COMPLETADO"
+    // 3. Abrir imagen ORIGINAL desde download_path
+    // 4. Guardar como PNG (compresión natural)
+    // 5. Guardar en storage/{uuid}_formato_cambiado.png
+    // 6. Actualizar DB: convert_path, convert_time_sec, convert_worker_id
+    // [NO depende del resize - trabaja independientemente desde la original]
+}
+```
+
+#### Watermark Worker (CPU-Bound)
+
+- **Tipo:** CPU-bound (dibuja sobre imagen)
+- **Responsabilidad:** Aplicar marca de agua visible, **trabaja directamente desde la imagen original**
+- **Métricas guardadas:** Tiempo de procesamiento, worker ID
+- **Responsabilidad adicional:** Detectar fin del job
+
+```go
+func (w *WatermarkWorker) process(msg Message) error {
+    // 1. Consultar DB: SELECT download_path, download_status FROM images WHERE id = ?
+    // 2. Esperar polling hasta que download_status = "COMPLETADO"
+    // 3. Abrir imagen ORIGINAL desde download_path
+    // 4. Dibujar rectángulo semi-transparente en la parte inferior
+    // 5. Dibujar texto: "CECAR, HOY TE AMO MENOS QUE AYER"
+    // 6. Guardar en storage/{uuid}_marca_agua.png
+    // 7. Actualizar DB: watermark_path, watermark_time_sec, watermark_worker_id
+    // 8. Verificar: si processed_files + failed_files >= total_files
+    //    → Marcar job como COMPLETADO o COMPLETADO_CON_ERRORES
+    // [NO depende del convert - trabaja independientemente desde la original]
+}
 ```
 
 ---
 
-## Tecnologías Utilizadas
+## 3. Arquitectura del Servicio `pmic-query`
 
-| Categoría | Tecnología | Versión | Propósito |
-|-----------|-----------|---------|-----------|
-| **Lenguaje** | Go | 1.25 | Lógica de negocio, concurrencia nativa |
-| **Framework Web** | Fiber | v2 | API REST de alto rendimiento |
-| **Base de Datos** | PostgreSQL | 14+ | Persistencia de jobs e imágenes |
-| **ORM** | GORM | v2 | Mapeo objeto-relacional |
-| **Mensajería** | NATS | Latest | Colas de mensajes asíncronas |
-| **Imágenes** | imaging | latest | Procesamiento de imágenes (resize, convert) |
-| **Gráficos** | gg | latest | Dibujo de marca de agua |
-| **IDs** | google/uuid | latest | Generación de UUIDs |
+El servicio `pmic-query` es un servicio de solo lectura que consulta el estado de los jobs desde la misma base de datos PostgreSQL.
+
+### 3.1 Estructura del Proyecto
+
+```
+pmic-query/
+├── main.go              # Punto de entrada y servidor HTTP
+├── models.go            # Modelos de datos (lectura)
+├── go.mod
+└── go.sum
+```
+
+### 3.2 Responsabilidades
+
+- **Consulta de estado:** Recuperar información completa de un job por su ID
+- **Cálculo de métricas:** Agregar métricas de todas las imágenes del job
+- **CORS:** Habilitado para permitir acceso desde el frontend
+
+### 3.3 Endpoint de Consulta
+
+```
+GET /api/v1/status/:job_id
+
+Response:
+{
+  "job_info": {
+    "id": "uuid",
+    "status": "EN_PROCESO|COMPLETADO|COMPLETADO_CON_ERRORES|FALLIDO",
+    "start_time": "2024-01-01T00:00:00Z",
+    "end_time": "2024-01-01T00:05:00Z",
+    "total_time_seconds": 300
+  },
+  "workers_config": {
+    "workers_download": 5,
+    "workers_resize": 3,
+    "workers_convert": 3,
+    "workers_watermark": 2
+  },
+  "metrics": {
+    "downloads": {
+      "total": 10,
+      "successful": 9,
+      "failed": 1,
+      "total_time_sec": 45.5,
+      "avg_time_sec": 5.06
+    },
+    "resize": { ... },
+    "convert": { ... },
+    "watermark": { ... }
+  },
+  "summary": {
+    "total_files": 10,
+    "processed_files": 9,
+    "failed_files": 1,
+    "success_rate": 90.0
+  }
+}
+```
 
 ---
 
-## Variables de Entorno
+## 4. Modelo de Datos
 
-| Variable | Valor por Defecto | Descripción |
-|----------|-------------------|-------------|
-| `DATABASE_URL` | `host=localhost user=postgres password=pass_postgres dbname=pmic port=5432 sslmode=disable` | Conexión PostgreSQL |
-| `NATS_URL` | `nats://localhost:4222` | URL del servidor NATS |
-| `STORAGE_PATH` | `./storage` | Directorio de almacenamiento de imágenes |
+### 4.1 Tabla `jobs`
+
+| Campo | Tipo | Descripción |
+|-------|------|-------------|
+| `id` | UUID | Identificador único del job |
+| `status` | VARCHAR(50) | Estado: EN_PROCESO, COMPLETADO, COMPLETADO_CON_ERRORES, FALLIDO |
+| `total_files` | INT | Total de imágenes a procesar |
+| `processed_files` | INT | Imágenes procesadas exitosamente |
+| `failed_files` | INT | Imágenes con error |
+| `start_time` | TIMESTAMP | Inicio del procesamiento |
+| `end_time` | TIMESTAMP | Fin del procesamiento |
+| `workers_download` | INT | Workers configurados para descarga |
+| `workers_resize` | INT | Workers configurados para redimensionamiento |
+| `workers_convert` | INT | Workers configurados para conversión |
+| `workers_watermark` | INT | Workers configurados para marca de agua |
+
+### 4.2 Tabla `images`
+
+| Campo | Tipo | Descripción |
+|-------|------|-------------|
+| `id` | UUID | Identificador único de la imagen |
+| `job_id` | UUID | FK al job padre |
+| `original_url` | TEXT | URL original de descarga |
+| `download_status` | VARCHAR(50) | Estado de la descarga |
+| `download_path` | TEXT | Ruta del archivo descargado |
+| `download_time_sec` | FLOAT | Tiempo de descarga |
+| `download_worker_id` | VARCHAR | ID del worker que descargó |
+| `resize_status` | VARCHAR(50) | Estado del redimensionamiento |
+| `resize_path` | TEXT | Ruta del archivo redimensionado |
+| `resize_time_sec` | FLOAT | Tiempo de redimensionamiento |
+| `resize_worker_id` | VARCHAR | ID del worker que redimensionó |
+| `convert_status` | VARCHAR(50) | Estado de la conversión |
+| `convert_path` | TEXT | Ruta del archivo convertido |
+| `convert_time_sec` | FLOAT | Tiempo de conversión |
+| `convert_worker_id` | VARCHAR | ID del worker que convirtió |
+| `watermark_status` | VARCHAR(50) | Estado de la marca de agua |
+| `watermark_path` | TEXT | Ruta del archivo final |
+| `watermark_time_sec` | FLOAT | Tiempo de aplicación de marca de agua |
+| `watermark_worker_id` | VARCHAR | ID del worker que aplicó marca de agua |
 
 ---
 
-## Cumplimiento de Requisitos Funcionales
+## 5. Comunicación entre Servicios
 
-| RF | Descripción | Implementación |
-|----|-------------|----------------|
-| **RF1** | Recepción de Solicitud | `job_handler.go:37-109` - Endpoint POST, validaciones, creación de Job, retorno de job_id |
-| **RF2** | Descarga Concurrente | `download_worker.go` - Cola NATS, 5 workers, métricas de tamaño/tiempo/worker |
-| **RF3** | Redimensionamiento | `resize_worker.go` - Fórmula 800px, algoritmo Lanczos, sufijo `_redimensionado` |
-| **RF4** | Conversión Formato | `convert_worker.go` - Conversión a PNG, sufijo `_formato_cambiado` |
-| **RF5** | Marca de Agua | `watermark_worker.go` - Banner negro + texto "WATERMARK - PMIC", sufijo `_marca_agua` |
-| **RF6** | Consulta de Estado | Estructura de BD soporta métricas; endpoint adicional requerido |
+Los servicios se comunican mediante **Base de Datos Compartida** (Shared Database pattern), no mediante llamadas HTTP directas:
+
+```
+┌─────────────────┐           ┌──────────────────┐
+│     pmic       │           │   pmic-query     │
+│                │           │                  │
+│  ┌───────────┐ │           │  ┌───────────┐   │
+│  │  ESCRIBE  │─┼──────────►│  │   LEE     │   │
+│  │  Jobs     │ │   Misma   │  │   Jobs    │   │
+│  │  Images   │ │   DB      │  │   Images  │   │
+│  └───────────┘ │           │  └───────────┘   │
+└─────────────────┘           └──────────────────┘
+```
+
+**Ventajas:**
+- Desacoplamiento de servicios
+- No hay dependencia de disponibilidad entre servicios
+- Lecturas y escrituras pueden escalar independientemente
 
 ---
 
-## Notas de Arquitectura
+## 6. Configuración y Variables de Entorno
 
-1. **Desacoplamiento**: Cada etapa es independiente y se comunica solo vía NATS
-2. **Escalabilidad**: Los workers pueden escalar horizontalmente independientemente
-3. **Tolerancia a Fallos**: Fallos en una etapa no afectan otras imágenes
-4. **Observabilidad**: Todos los metadatos se almacenan en PostgreSQL
-5. **Persistencia**: Las imágenes se almacenan en disco local
-6. **Concurrencia Real**: Los workers son goroutines independientes con suscripciones NATS
+| Variable | Descripción | Default |
+|----------|-------------|---------|
+| `DATABASE_URL` | Connection string PostgreSQL | `host=localhost user=postgres password=pass_postgres dbname=pmic port=5432 sslmode=disable` |
+| `STORAGE_PATH` | Ruta de almacenamiento de imágenes | `./storage` |
+
+---
+
+## 7. Tipos de Procesamiento: IO-Bound vs CPU-Bound
+
+| Etapa | Tipo | Descripción | Estrategia de Workers |
+|-------|------|-------------|----------------------|
+| **Descarga** | IO-Bound | Espera respuesta de red HTTP | Más workers (N >= conexiones HTTP concurrentes) |
+| **Redimensionamiento** | CPU-Bound | Procesamiento de imagen | Workers ~ núcleos CPU |
+| **Conversión** | CPU-Bound | Codificación PNG | Workers ~ núcleos CPU |
+| **Marca de Agua** | CPU-Bound | Dibujado sobre imagen | Workers ~ núcleos CPU |
+
+En Go, los goroutines son eficientes para ambos tipos porque:
+- **IO-Bound:** El scheduler de Go puede manejar miles de goroutines bloqueadas en IO
+- **CPU-Bound:** El runtime utiliza GOMAXPROCS para paralelizar en múltiples núcleos
+
+---
+
+## 8. Diagrama de Secuencia (Procesamiento Paralelo)
+
+```
+Cliente                    pmic                    PostgreSQL      Download   Resize     Convert    Watermark
+  |                         |                          │            Workers    Workers    Workers    Workers
+  │ POST /process           │                          │               │          │          │          │
+  │ {urls: [...]}           │                          │               │          │          │          │
+  ├────────────────────────►│                          │               │          │          │          │
+  │                         │ INSERT jobs, images      │               │          │          │          │
+  │                         ├─────────────────────────►│               │          │          │          │
+  │                         │                          │               │          │          │          │
+  │                         │ Enviar mensajes a        │               │          │          │          │
+  │                         │ TODAS las colas          │               │          │          │          │
+  │                         │ (Download, Resize,       │               │          │          │          │
+  │                         │  Convert, Watermark)     │               │          │          │          │
+  │                         ├──────────────────────────────────────────►│          │          │          │
+  │                         ├────────────────────────────────────────────────────►│          │          │
+  │                         ├───────────────────────────────────────────────────────────────►│          │
+  │                         ├──────────────────────────────────────────────────────────────────────────►│
+  │                         │                          │               │          │          │          │
+  │     {job_id: uuid}      │                          │               │          │          │          │
+  │◄────────────────────────┤                          │               │          │          │          │
+  │                         │                          │               │          │          │          │
+  │                         │                          │    Descargar  │          │          │          │
+  │                         │                          │◄──────────────┤          │          │          │
+  │                         │ UPDATE download_status   │               │          │          │          │
+  │                         │ download_path            │               │          │          │          │
+  │                         ├◄─────────────────────────│               │          │          │          │
+  │                         │                          │               │          │          │          │
+  │                         │                          │               │   Leer DB (espera)│          │
+  │                         │                          │               │◄─────────│          │          │
+  │                         │                          │               │          │          │          │
+  │                         │                          │               │   Leer DB (espera)│          │
+  │                         │                          │               │◄─────────────────────│          │
+  │                         │                          │               │          │          │          │
+  │                         │                          │               │   Leer DB (espera)│          │
+  │                         │                          │               │◜────────────────────────────────│
+  │                         │                          │               │          │          │          │
+  │                         │                          │               │ [Procesar paralelo desde img original]
+  │                         │                          │               │          │          │          │
+  │                         │                          │◄──────────────┤          │          │          │
+  │                         │ UPDATE resize_status     │               │          │          │          │
+  │                         │ resize_path, etc       │◄──────────────────────────┤          │          │
+  │                         │ UPDATE convert_status    │◜───────────────────────────────────────┤          │
+  │                         │ UPDATE watermark_status  │◜──────────────────────────────────────────────────│
+  │                         │                          │               │          │          │          │
+  │ GET /status/:job_id     │                          │               │          │          │          │
+  ├────────────────────────►│                          │               │          │          │          │
+  │                         │ SELECT jobs, images      │               │          │          │          │
+  │                         ├─────────────────────────►│               │          │          │          │
+  │                         │◄─────────────────────────│               │          │          │          │
+  │  JSON con status y      │                          │               │          │          │          │
+  │  métricas de todas      │                          │               │          │          │          │
+  │  las etapas             │                          │               │          │          │          │
+  │◄────────────────────────┤                          │               │          │          │          │
+  │                         │                          │               │          │          │          │
+  │          ... (polling)  │                          │               │          │          │          │
+  │                         │                          │               │          │          │          │
+  │                         │ UPDATE job status        │               │          │          │          │
+  │                         │ COMPLETADO               │               │          │          │          │
+  │                         ├◄─────────────────────────│               │          │          │          │
+  │                         │                          │               │          │          │          │
+```
+
+---
+
+## 9. Dependencias Principales
+
+| Dependencia | Versión | Uso |
+|-------------|---------|-----|
+| `github.com/gofiber/fiber/v2` | v2.x | Framework HTTP |
+| `gorm.io/gorm` | v1.x | ORM para PostgreSQL |
+| `gorm.io/driver/postgres` | v1.x | Driver PostgreSQL |
+| `github.com/disintegration/imaging` | v1.x | Procesamiento de imágenes |
+| `github.com/google/uuid` | v1.x | Generación de UUIDs |
+
+---
+
+## 10. Ejecución
+
+### Servicio pmic (Puerto 5000)
+
+```bash
+cd pmic
+go run cmd/main.go
+```
+
+### Servicio pmic-query (Puerto 3001)
+
+```bash
+cd pmic-query
+go run main.go
+```
+
+---
+
+## 11. Referencias
+
+- [Go Concurrency Patterns](https://go.dev/blog/pipelines)
+- [Effective Go - Concurrency](https://go.dev/doc/effective_go#concurrency)
+- [GORM Documentation](https://gorm.io/docs/)
+- [Fiber Framework](https://docs.gofiber.io/)
