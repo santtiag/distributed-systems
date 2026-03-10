@@ -1,110 +1,109 @@
 package workers
 
 import (
-	"encoding/json"
-	"fmt"
-	"path/filepath"
-	"strings"
-	"time"
+    "fmt"
+    "path/filepath"
+    "strings"
+    "time"
 
-	"pmic/internal/models"
-	"pmic/internal/queue"
+    "pmic/internal/models"
+    "pmic/internal/queue"
 
-	"github.com/disintegration/imaging"
-	"github.com/nats-io/nats.go"
-	"gorm.io/gorm"
+    "github.com/disintegration/imaging"
+    "gorm.io/gorm"
 )
 
 type ConvertWorker struct {
-	WorkerID string
-	DB       *gorm.DB
-	Queue    *queue.Queue
-	Storage  string
+    WorkerID string
+    DB       *gorm.DB
+    InChan   <-chan queue.Message // Canal de conversión
+    Storage  string
 }
 
-func (w *ConvertWorker) Start() error {
-	_, err := w.Queue.Subscribe(queue.SubjectConvert, w.processMessage)
-	if err != nil {
-		return fmt.Errorf("error suscribiendo worker %s: %v", w.WorkerID, err)
-	}
-	fmt.Printf("Worker de conversión iniciado: %s\n", w.WorkerID)
-	return nil
+func (w *ConvertWorker) Start() {
+    fmt.Printf("Worker de conversión iniciado: %s\n", w.WorkerID)
+    go func() {
+        for task := range w.InChan {
+            w.processMessage(task)
+        }
+    }()
 }
 
-func (w *ConvertWorker) processMessage(msg *nats.Msg) {
-	var task queue.Message
-	if err := json.Unmarshal(msg.Data, &task); err != nil {
-		fmt.Printf("[%s] Error decodificando mensaje: %v\n", w.WorkerID, err)
-		return
-	}
+func (w *ConvertWorker) processMessage(task queue.Message) {
+    fmt.Printf("[%s] Iniciando conversión formato para imagen: %s\n", w.WorkerID, task.ImageID)
+    startTime := time.Now()
 
-	fmt.Printf("[%s] Iniciando conversión formato: %s\n", w.WorkerID, task.FileName)
+    // Actualizar estado a PROCESSING
+    w.DB.Model(&models.Image{}).Where("id = ?", task.ImageID).Update("convert_status", "PROCESSING")
 
-	startTime := time.Now()
+    // Leer de la DB el download_path y esperar si es necesario
+    var image models.Image
+    if err := w.DB.First(&image, "id = ?", task.ImageID).Error; err != nil {
+        w.marcarFallo(task.ImageID, fmt.Sprintf("Error leyendo imagen de DB: %v", err))
+        return
+    }
 
-	// 1. Marca estado de conversión a PROCESSING en BD
-	w.DB.Model(&models.Image{}).Where("id = ?", task.ImageID).Update("convert_status", "PROCESSING")
+    // Si la descarga falló, no podemos procesar
+    if image.DownloadStatus == models.StatusFallido {
+        w.marcarFallo(task.ImageID, "No se puede convertir: la descarga falló")
+        return
+    }
 
-	// 2. Abrir la imagen redimensionada (pesada en memoria RAM)
-	img, err := imaging.Open(task.InputPath)
-	if err != nil {
-		w.marcarFallo(task.ImageID, fmt.Sprintf("Error abriendo imagen para conversión: %v", err))
-		return
-	}
+    // Esperar a que la descarga esté completada
+    for image.DownloadStatus != models.StatusCompletado {
+        time.Sleep(100 * time.Millisecond)
+        if err := w.DB.First(&image, "id = ?", task.ImageID).Error; err != nil {
+            w.marcarFallo(task.ImageID, fmt.Sprintf("Error leyendo imagen de DB: %v", err))
+            return
+        }
+        if image.DownloadStatus == models.StatusFallido {
+            w.marcarFallo(task.ImageID, "No se puede convertir: la descarga falló")
+            return
+        }
+    }
 
-	// 3. Generar el nuevo nombre de archivo (RF4)
-	// Quitamos la extensión vieja y cualquier sufijo previo que traiga la tarea de NATS
-	extOriginal := filepath.Ext(task.FileName)
-	base := strings.TrimSuffix(task.FileName, "_redimensionado"+extOriginal) // si venía del resize standard
+    inputPath := image.DownloadPath
+    img, err := imaging.Open(inputPath)
+    if err != nil {
+        w.marcarFallo(task.ImageID, fmt.Sprintf("Error abriendo imagen para conversión: %v", err))
+        return
+    }
 
-	// Prevenir si el nombre base igual trae sufijos rebeldes
-	if strings.Contains(base, "_redimensionado") {
-		base = strings.Split(base, "_redimensionado")[0]
-	}
+    // Usar el nombre de archivo desde la base de datos
+    extOriginal := filepath.Ext(image.FileName)
+    base := strings.TrimSuffix(image.FileName, "_original"+extOriginal)
+    if base == image.FileName {
+        base = strings.TrimSuffix(image.FileName, extOriginal)
+    }
 
-	// Forzamos el nombre con el sufijo solicitado y extensión .png [1]
-	newFileName := fmt.Sprintf("%s_formato_cambiado.png", base)
-	newFilePath := filepath.Join(w.Storage, newFileName)
+    newFileName := fmt.Sprintf("%s_formato_cambiado.png", base)
+    newFilePath := filepath.Join(w.Storage, newFileName)
 
-	// 4. Guardar como PNG (CPU-bound)
-	// imaging.Save usa automáticamente el encoder PNG al ver la extensión ".png"
-	err = imaging.Save(img, newFilePath)
-	if err != nil {
-		w.marcarFallo(task.ImageID, "Error ejecutando compresión PNG")
-		return
-	}
+    err = imaging.Save(img, newFilePath)
+    if err != nil {
+        w.marcarFallo(task.ImageID, "Error ejecutando compresión PNG")
+        return
+    }
 
-	// 5. Calcular métricas (RF4)
-	convertTimeSec := time.Since(startTime).Seconds()
-	now := time.Now()
+    convertTimeSec := time.Since(startTime).Seconds()
+    now := time.Now()
 
-	// 6. Actualizar BD con metadatos de conversión
-	w.DB.Model(&models.Image{}).Where("id = ?", task.ImageID).Updates(map[string]interface{}{
-		"convert_status":    models.StatusCompletado,
-		"convert_path":      newFilePath, // Path de la imagen .png
-		"convert_time_sec":  convertTimeSec,
-		"convert_worker_id": w.WorkerID,
-		"converted_at":      &now,
-	})
+    w.DB.Model(&models.Image{}).Where("id = ?", task.ImageID).Updates(map[string]interface{}{
+        "convert_status":    models.StatusCompletado,
+        "convert_path":      newFilePath,
+        "convert_time_sec":  convertTimeSec,
+        "convert_worker_id": w.WorkerID,
+        "converted_at":      &now,
+    })
 
-	fmt.Printf("[%s] Conversión PNG exitosa: %s (%.2fs)\n", w.WorkerID, newFileName, convertTimeSec)
-
-	// 7. Enviar a la última etapa del pipeline: Marca de Agua (RF5)
-	nextTask := queue.Message{
-		JobID:     task.JobID,
-		ImageID:   task.ImageID,
-		InputPath: newFilePath, // Entrada para el próximo worker: el PNG gordo
-		FileName:  newFileName,
-	}
-
-	w.Queue.Publish(queue.SubjectWatermark, nextTask)
+    fmt.Printf("[%s] Conversión PNG exitosa: %s (%.2fs)\n", w.WorkerID, newFileName, convertTimeSec)
 }
 
 func (w *ConvertWorker) marcarFallo(imageID string, errorMsg string) {
-	fmt.Printf("[%s] Falló conversión de %s: %s\n", w.WorkerID, imageID, errorMsg)
-	w.DB.Model(&models.Image{}).Where("id = ?", imageID).Updates(map[string]interface{}{
-		"convert_status": models.StatusFallido,
-		"error_message":  errorMsg,
-	})
-	w.DB.Exec("UPDATE jobs SET failed_files = failed_files + 1 WHERE id = (SELECT job_id FROM images WHERE id = ?)", imageID)
+    fmt.Printf("[%s] Falló conversión de %s: %s\n", w.WorkerID, imageID, errorMsg)
+    w.DB.Model(&models.Image{}).Where("id = ?", imageID).Updates(map[string]interface{}{
+        "convert_status": models.StatusFallido,
+        "error_message":  errorMsg,
+    })
+    w.DB.Exec("UPDATE jobs SET failed_files = failed_files + 1 WHERE id = (SELECT job_id FROM images WHERE id = ?)", imageID)
 }

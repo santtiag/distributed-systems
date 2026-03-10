@@ -1,15 +1,15 @@
 package handlers
 
 import (
-	"pmic/internal/models"
-	"pmic/internal/queue"
-	"time"
+    "pmic/internal/models"
+    "pmic/internal/queue"
+    "pmic/internal/workers"
+    "time"
 
-	"github.com/gofiber/fiber/v2"
-	"gorm.io/gorm"
+    "github.com/gofiber/fiber/v2"
+    "gorm.io/gorm"
 )
 
-// RequestPayload representa el JSON que envía el cliente (RF1)
 type RequestPayload struct {
     URLs             []string `json:"urls"`
     WorkersDownload  int      `json:"workers_download"`
@@ -18,46 +18,55 @@ type RequestPayload struct {
     WorkersWatermark int      `json:"workers_watermark"`
 }
 
-// ResponsePayload representa la respuesta exitosa
 type ResponsePayload struct {
     JobID   string `json:"job_id"`
     Message string `json:"message"`
 }
 
 type JobHandler struct {
-    DB *gorm.DB
-	Queue *queue.Queue // AÑADIDO: Referencia a la cola NATS
+    DB         *gorm.DB
+    Pipeline   *queue.PipelineChannels
+    WorkerPool *workers.DynamicWorkerPool
 }
 
-func NewJobHandler(db *gorm.DB, q *queue.Queue) *JobHandler {
-    return &JobHandler{DB: db, Queue: q}
+func NewJobHandler(db *gorm.DB, p *queue.PipelineChannels, wp *workers.DynamicWorkerPool) *JobHandler {
+    return &JobHandler{DB: db, Pipeline: p, WorkerPool: wp}
 }
 
-// CreateJob maneja la recepción de la solicitud
 func (h *JobHandler) CreateJob(c *fiber.Ctx) error {
     var payload RequestPayload
 
-    // Parsear el JSON
     if err := c.BodyParser(&payload); err != nil {
-        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-            "error": "Body inválido o mal formado",
-        })
+        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Payload inválido"})
     }
 
-    // Validaciones básicas
     if len(payload.URLs) == 0 {
-        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-            "error": "Debe enviar al menos una URL",
-        })
+        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Se requiere al menos una URL"})
     }
 
-    // Configuración de workers mínima (asegurar que haya al menos 1 por etapa)
-    if payload.WorkersDownload <= 0 { payload.WorkersDownload = 1 }
-    if payload.WorkersResize <= 0 { payload.WorkersResize = 1 }
-    if payload.WorkersConvert <= 0 { payload.WorkersConvert = 1 }
-    if payload.WorkersWatermark <= 0 { payload.WorkersWatermark = 1 }
+    // Validar y establecer valores por defecto para workers
+    if payload.WorkersDownload <= 0 {
+        payload.WorkersDownload = 1
+    }
+    if payload.WorkersResize <= 0 {
+        payload.WorkersResize = 1
+    }
+    if payload.WorkersConvert <= 0 {
+        payload.WorkersConvert = 1
+    }
+    if payload.WorkersWatermark <= 0 {
+        payload.WorkersWatermark = 1
+    }
 
-    // Crear el registro del Job en la base de datos (RF1 y RF6)
+    // Escalar workers dinámicamente según el payload
+    h.WorkerPool.EnsureWorkers(
+        payload.WorkersDownload,
+        payload.WorkersResize,
+        payload.WorkersConvert,
+        payload.WorkersWatermark,
+    )
+
+    // Crear Job en BD
     job := models.Job{
         Status:           models.StatusEnProceso,
         TotalFiles:       len(payload.URLs),
@@ -70,40 +79,37 @@ func (h *JobHandler) CreateJob(c *fiber.Ctx) error {
         WorkersWatermark: payload.WorkersWatermark,
     }
 
-    // Guardar el Job (GORM generará el ID UUID automáticamente gracias al hook BeforeCreate)
     if err := h.DB.Create(&job).Error; err != nil {
-        return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-            "error": "Error creando el trabajo en la base de datos",
-        })
+        return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Error creando el Job"})
     }
 
-    // Guardar las imágenes iniciales pendientes de descarga
+    // Guardar las imágenes y mandar a todas las colas en paralelo
     for _, url := range payload.URLs {
         image := models.Image{
-            JobID:          job.ID,
-            OriginalURL:    url,
-            DownloadStatus: "PENDING",
-            ResizeStatus:   "PENDING",
-            ConvertStatus:  "PENDING",
+            JobID:           job.ID,
+            OriginalURL:     url,
+            DownloadStatus:  "PENDING",
+            ResizeStatus:    "PENDING",
+            ConvertStatus:   "PENDING",
             WatermarkStatus: "PENDING",
         }
 
-		// NOTA: En el Paso 3 enviaremos el mensaje a NATS aquí para iniciar la descarga.
-		if err := h.DB.Create(&image).Error; err == nil {
-            // AÑADIDO: Enviar a la cola de NATS (Desacoplamiento RF2)
+        if err := h.DB.Create(&image).Error; err == nil {
             taskMsg := queue.Message{
                 JobID:   job.ID,
                 ImageID: image.ID,
                 URL:     url,
             }
-            h.Queue.Publish(queue.SubjectDownload, taskMsg)
+            // Enviar a todas las colas en paralelo - cada worker leerá de la DB el download_path
+            h.Pipeline.DownloadChan <- taskMsg
+            h.Pipeline.ResizeChan <- taskMsg
+            h.Pipeline.ConvertChan <- taskMsg
+            h.Pipeline.WatermarkChan <- taskMsg
         }
-
     }
 
-    // Retornamos el identificador del procesamiento [1]
     return c.Status(fiber.StatusAccepted).JSON(ResponsePayload{
         JobID:   job.ID,
-        Message: "Procesamiento iniciado correctamente",
+        Message: "Procesamiento en memoria iniciado correctamente",
     })
 }
