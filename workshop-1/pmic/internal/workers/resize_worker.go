@@ -16,8 +16,7 @@ import (
 type ResizeWorker struct {
     WorkerID string
     DB       *gorm.DB
-    InChan   <-chan queue.Message // Canal de lectura (Redimensión)
-    OutChan  chan<- queue.Message // Canal de escritura (Conversión)
+    InChan   <-chan queue.Message // Canal de lectura (Resize)
     Storage  string
 }
 
@@ -31,12 +30,40 @@ func (w *ResizeWorker) Start() {
 }
 
 func (w *ResizeWorker) processMessage(task queue.Message) {
-    fmt.Printf("[%s] Iniciando redimensionamiento: %s\n", w.WorkerID, task.FileName)
+    fmt.Printf("[%s] Iniciando redimensionamiento para imagen: %s\n", w.WorkerID, task.ImageID)
     startTime := time.Now()
 
+    // Actualizar estado a PROCESSING
     w.DB.Model(&models.Image{}).Where("id = ?", task.ImageID).Update("resize_status", "PROCESSING")
 
-    img, err := imaging.Open(task.InputPath)
+    // Leer de la DB el download_path y esperar si es necesario
+    var image models.Image
+    if err := w.DB.First(&image, "id = ?", task.ImageID).Error; err != nil {
+        w.marcarFallo(task.ImageID, fmt.Sprintf("Error leyendo imagen de DB: %v", err))
+        return
+    }
+
+    // Si la descarga falló, no podemos procesar
+    if image.DownloadStatus == models.StatusFallido {
+        w.marcarFallo(task.ImageID, "No se puede redimensionar: la descarga falló")
+        return
+    }
+
+    // Esperar a que la descarga esté completada
+    for image.DownloadStatus != models.StatusCompletado {
+        time.Sleep(100 * time.Millisecond)
+        if err := w.DB.First(&image, "id = ?", task.ImageID).Error; err != nil {
+            w.marcarFallo(task.ImageID, fmt.Sprintf("Error leyendo imagen de DB: %v", err))
+            return
+        }
+        if image.DownloadStatus == models.StatusFallido {
+            w.marcarFallo(task.ImageID, "No se puede redimensionar: la descarga falló")
+            return
+        }
+    }
+
+    inputPath := image.DownloadPath
+    img, err := imaging.Open(inputPath)
     if err != nil {
         w.marcarFallo(task.ImageID, fmt.Sprintf("Error abriendo imagen: %v", err))
         return
@@ -46,18 +73,18 @@ func (w *ResizeWorker) processMessage(task queue.Message) {
     origWidth := float64(bounds.Dx())
     origHeight := float64(bounds.Dy())
 	
-	// WARNING: Tener en cuenta
-    targetAncho := 800.0
+    targetAncho := 1200.0
     targetAlto := origHeight * (targetAncho / origWidth)
     newWidthIDx := int(targetAncho)
     newHeightIDx := int(targetAlto)
 
     resizedImg := imaging.Resize(img, newWidthIDx, newHeightIDx, imaging.Lanczos)
 
-    ext := filepath.Ext(task.FileName)
-    baseName := strings.TrimSuffix(task.FileName, "_original"+ext)
-    if !strings.Contains(baseName, "_original") {
-        baseName = strings.TrimSuffix(task.FileName, ext)
+    // Usar el nombre de archivo desde la base de datos
+    ext := filepath.Ext(image.FileName)
+    baseName := strings.TrimSuffix(image.FileName, "_original"+ext)
+    if baseName == image.FileName {
+        baseName = strings.TrimSuffix(image.FileName, ext)
     }
 
     newFileName := fmt.Sprintf("%s_redimensionado%s", baseName, ext)
@@ -84,15 +111,6 @@ func (w *ResizeWorker) processMessage(task queue.Message) {
     })
 
     fmt.Printf("[%s] Redimensión exitosa: %s (%.2fs)\n", w.WorkerID, newFileName, resizeTimeSec)
-
-    nextTask := queue.Message{
-        JobID:     task.JobID,
-        ImageID:   task.ImageID,
-        InputPath: newFilePath,
-        FileName:  newFileName,
-    }
-
-    w.OutChan <- nextTask
 }
 
 func (w *ResizeWorker) marcarFallo(imageID string, errorMsg string) {

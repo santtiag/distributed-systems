@@ -83,7 +83,7 @@ func (h *JobHandler) CreateJob(c *fiber.Ctx) error {
         return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Error creando el Job"})
     }
 
-    // Guardar las imágenes y mandar al canal nativo de Go
+    // Guardar las imágenes y mandar a todas las colas en paralelo
     for _, url := range payload.URLs {
         image := models.Image{
             JobID:           job.ID,
@@ -100,8 +100,11 @@ func (h *JobHandler) CreateJob(c *fiber.Ctx) error {
                 ImageID: image.ID,
                 URL:     url,
             }
-            // Enviar a la cola en memoria
+            // Enviar a todas las colas en paralelo - cada worker leerá de la DB el download_path
             h.Pipeline.DownloadChan <- taskMsg
+            h.Pipeline.ResizeChan <- taskMsg
+            h.Pipeline.ConvertChan <- taskMsg
+            h.Pipeline.WatermarkChan <- taskMsg
         }
     }
 

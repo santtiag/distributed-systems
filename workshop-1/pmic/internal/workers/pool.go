@@ -49,7 +49,6 @@ func (p *DynamicWorkerPool) EnsureWorkers(downloadCount, resizeCount, convertCou
 				WorkerID: workerID,
 				DB:       p.db,
 				InChan:   p.pipeline.DownloadChan,
-				OutChan:  p.pipeline.ResizeChan,
 				Storage:  p.storage,
 			}
 			worker.Start()
@@ -66,7 +65,6 @@ func (p *DynamicWorkerPool) EnsureWorkers(downloadCount, resizeCount, convertCou
 				WorkerID: workerID,
 				DB:       p.db,
 				InChan:   p.pipeline.ResizeChan,
-				OutChan:  p.pipeline.ConvertChan,
 				Storage:  p.storage,
 			}
 			worker.Start()
@@ -83,7 +81,6 @@ func (p *DynamicWorkerPool) EnsureWorkers(downloadCount, resizeCount, convertCou
 				WorkerID: workerID,
 				DB:       p.db,
 				InChan:   p.pipeline.ConvertChan,
-				OutChan:  p.pipeline.WatermarkChan,
 				Storage:  p.storage,
 			}
 			worker.Start()

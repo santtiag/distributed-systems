@@ -31,12 +31,40 @@ func (w *WatermarkWorker) Start() {
 }
 
 func (w *WatermarkWorker) processMessage(task queue.Message) {
-    fmt.Printf("[%s] Aplicando marca de agua a: %s\n", w.WorkerID, task.FileName)
+    fmt.Printf("[%s] Aplicando marca de agua a imagen: %s\n", w.WorkerID, task.ImageID)
     startTime := time.Now()
 
+    // Actualizar estado a PROCESSING
     w.DB.Model(&models.Image{}).Where("id = ?", task.ImageID).Update("watermark_status", "PROCESSING")
 
-    img, err := imaging.Open(task.InputPath)
+    // Leer de la DB el download_path y esperar si es necesario
+    var image models.Image
+    if err := w.DB.First(&image, "id = ?", task.ImageID).Error; err != nil {
+        w.marcarFallo(task.JobID, task.ImageID, fmt.Sprintf("Error leyendo imagen de DB: %v", err))
+        return
+    }
+
+    // Si la descarga falló, no podemos procesar
+    if image.DownloadStatus == models.StatusFallido {
+        w.marcarFallo(task.JobID, task.ImageID, "No se puede aplicar marca de agua: la descarga falló")
+        return
+    }
+
+    // Esperar a que la descarga esté completada
+    for image.DownloadStatus != models.StatusCompletado {
+        time.Sleep(100 * time.Millisecond)
+        if err := w.DB.First(&image, "id = ?", task.ImageID).Error; err != nil {
+            w.marcarFallo(task.JobID, task.ImageID, fmt.Sprintf("Error leyendo imagen de DB: %v", err))
+            return
+        }
+        if image.DownloadStatus == models.StatusFallido {
+            w.marcarFallo(task.JobID, task.ImageID, "No se puede aplicar marca de agua: la descarga falló")
+            return
+        }
+    }
+
+    inputPath := image.DownloadPath
+    img, err := imaging.Open(inputPath)
     if err != nil {
         w.marcarFallo(task.JobID, task.ImageID, fmt.Sprintf("Error abriendo imagen: %v", err))
         return
@@ -55,14 +83,14 @@ func (w *WatermarkWorker) processMessage(task queue.Message) {
     dc.DrawStringAnchored("CECAR, HOY TE AMO MENOS QUE AYER", width/2, height-25, 0.5, 0.5)
     outImg := dc.Image()
 
-    extOriginal := filepath.Ext(task.FileName)
-    base := strings.TrimSuffix(task.FileName, "_formato_cambiado"+extOriginal)
+    // Usar el nombre de archivo desde la base de datos
+    extOriginal := filepath.Ext(image.FileName)
+    base := strings.TrimSuffix(image.FileName, "_original"+extOriginal)
+    if base == image.FileName {
+        base = strings.TrimSuffix(image.FileName, extOriginal)
+    }
 
-    base = strings.Split(base, "_formato_cambiado")[0]
-    base = strings.Split(base, "_redimensionado")[0]
-    base = strings.Split(base, "_original")[0]
-
-    newFileName := fmt.Sprintf("%s_marca_agua.png", base)
+    newFileName := fmt.Sprintf("%s_marca_agua%s", base)
     newFilePath := filepath.Join(w.Storage, newFileName)
 
     err = imaging.Save(outImg, newFilePath)

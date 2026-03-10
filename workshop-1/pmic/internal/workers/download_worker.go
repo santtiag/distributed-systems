@@ -19,7 +19,6 @@ type DownloadWorker struct {
 	WorkerID string
 	DB       *gorm.DB
 	InChan   <-chan queue.Message // Canal de lectura
-	OutChan  chan<- queue.Message // Canal de escritura
 	Storage  string
 }
 
@@ -79,16 +78,7 @@ func (w *DownloadWorker) processMessage(task queue.Message) {
 	})
 
 	fmt.Printf("[%s] Descarga exitosa: %s (%.2f MB, %.2fs)\n", w.WorkerID, fileName, sizeMB, downloadTimeSec)
-
-	nextTask := queue.Message{
-		JobID:     task.JobID,
-		ImageID:   task.ImageID,
-		InputPath: filePath,
-		FileName:  fileName,
-	}
-
-	// Enviar al siguiente canal de manera nativa
-	w.OutChan <- nextTask
+	// Las demás colas leen directamente de la DB el download_path
 }
 
 func (w *DownloadWorker) marcarFallo(imageID string, errorMsg string) {
