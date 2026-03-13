@@ -1,170 +1,193 @@
 package main
 
 import (
-    "log"
-    "os"
-    "time"
+	"log"
+	"os"
+	"strconv"
+	"time"
 
-    "github.com/gofiber/fiber/v2"
-    "github.com/gofiber/fiber/v2/middleware/logger"
-    "github.com/gofiber/fiber/v2/middleware/cors"
-    "gorm.io/driver/postgres"
-    "gorm.io/gorm"
+	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/cors"
+	"github.com/gofiber/fiber/v2/middleware/logger"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
 )
 
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+func getEnvBool(key string, defaultValue bool) bool {
+	if value := os.Getenv(key); value != "" {
+		parsed, err := strconv.ParseBool(value)
+		if err == nil {
+			return parsed
+		}
+	}
+	return defaultValue
+}
+
 func main() {
-    // 1. Conectar a la misma base de datos del proyecto principal
-    dbURL := os.Getenv("DATABASE_URL")
-    if dbURL == "" {
-        dbURL = "host=localhost user=postgres password=pass_postgres dbname=pmic port=5432 sslmode=disable"
-    }
+	// 1. Conectar a la misma base de datos del proyecto principal
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		dbURL = "host=localhost user=postgres password=0000 dbname=pmic port=5432 sslmode=disable"
+	}
 
-    db, err := gorm.Open(postgres.Open(dbURL), &gorm.Config{})
-    if err != nil {
-        log.Fatal("Error conectando a BD:", err)
-    }
+	db, err := gorm.Open(postgres.Open(dbURL), &gorm.Config{})
+	if err != nil {
+		log.Fatal("Error conectando a BD:", err)
+	}
 
-    // 2. Configurar Fiber
-    app := fiber.New()
-    app.Use(logger.New())
-    
-    // Habilitar CORS es vital porque el Frontend (RF6) estará en otro puerto o dominio
-    app.Use(cors.New()) 
+	// 2. Configurar Fiber
+	app := fiber.New()
+	app.Use(logger.New())
 
-    // 3. Endpoint de consulta (RF6)
-    app.Get("/api/v1/status/:job_id", func(c *fiber.Ctx) error {
-        jobID := c.Params("job_id")
+	// Habilitar CORS es vital porque el Frontend (RF6) estará en otro puerto o dominio
+	app.Use(cors.New(cors.Config{
+		AllowOrigins:     getEnv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"),
+		AllowMethods:     "GET,OPTIONS",
+		AllowHeaders:     "Origin, Content-Type, Accept, Authorization",
+		AllowCredentials: getEnvBool("CORS_ALLOW_CREDENTIALS", false),
+	}))
 
-        var job Job
-        // Preload carga automáticamente todas las imágenes relacionadas a ese Job
-        result := db.Preload("Images").First(&job, "id = ?", jobID)
+	// 3. Endpoint de consulta (RF6)
+	app.Get("/api/v1/status/:job_id", func(c *fiber.Ctx) error {
+		jobID := c.Params("job_id")
 
-        if result.Error != nil {
-            return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-                "error": "Procesamiento no encontrado",
-            })
-        }
+		var job Job
+		// Preload carga automáticamente todas las imágenes relacionadas a ese Job
+		result := db.Preload("Images").First(&job, "id = ?", jobID)
 
-        // Calcular métricas globales extra para enriquecer la respuesta
-        var totalDownload, totalResize, totalConvert, totalWatermark float64
-        var downloadCompleted, downloadFailed int
-        var resizeCompleted, resizeFailed int
-        var convertCompleted, convertFailed int
-        var watermarkCompleted, watermarkFailed int
+		if result.Error != nil {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"error": "Procesamiento no encontrado",
+			})
+		}
 
-        for _, img := range job.Images {
-            // Tiempos totales
-            totalDownload += img.DownloadTimeSec
-            totalResize += img.ResizeTimeSec
-            totalConvert += img.ConvertTimeSec
-            totalWatermark += img.WatermarkTimeSec
+		// Calcular métricas globales extra para enriquecer la respuesta
+		var totalDownload, totalResize, totalConvert, totalWatermark float64
+		var downloadCompleted, downloadFailed int
+		var resizeCompleted, resizeFailed int
+		var convertCompleted, convertFailed int
+		var watermarkCompleted, watermarkFailed int
 
-            // Contadores por etapa (descarga) - estados en español según modelo
-            if img.DownloadStatus == "COMPLETADO" {
-                downloadCompleted++
-            } else if img.DownloadStatus == "FALLIDO" {
-                downloadFailed++
-            }
+		for _, img := range job.Images {
+			// Tiempos totales
+			totalDownload += img.DownloadTimeSec
+			totalResize += img.ResizeTimeSec
+			totalConvert += img.ConvertTimeSec
+			totalWatermark += img.WatermarkTimeSec
 
-            // Contadores por etapa (resize)
-            if img.ResizeStatus == "COMPLETADO" {
-                resizeCompleted++
-            } else if img.ResizeStatus == "FALLIDO" {
-                resizeFailed++
-            }
+			// Contadores por etapa (descarga) - estados en español según modelo
+			if img.DownloadStatus == "COMPLETADO" {
+				downloadCompleted++
+			} else if img.DownloadStatus == "FALLIDO" {
+				downloadFailed++
+			}
 
-            // Contadores por etapa (convert)
-            if img.ConvertStatus == "COMPLETADO" {
-                convertCompleted++
-            } else if img.ConvertStatus == "FALLIDO" {
-                convertFailed++
-            }
+			// Contadores por etapa (resize)
+			if img.ResizeStatus == "COMPLETADO" {
+				resizeCompleted++
+			} else if img.ResizeStatus == "FALLIDO" {
+				resizeFailed++
+			}
 
-            // Contadores por etapa (watermark) - incluye COMPLETADO_CON_ERRORES como completado
-            if img.WatermarkStatus == "COMPLETADO" || img.WatermarkStatus == "COMPLETADO_CON_ERRORES" {
-                watermarkCompleted++
-            } else if img.WatermarkStatus == "FALLIDO" {
-                watermarkFailed++
-            }
-        }
+			// Contadores por etapa (convert)
+			if img.ConvertStatus == "COMPLETADO" {
+				convertCompleted++
+			} else if img.ConvertStatus == "FALLIDO" {
+				convertFailed++
+			}
 
-        // Calcular tiempo total de ejecución del job
-        var totalExecutionTime float64
-        if job.EndTime != nil {
-            totalExecutionTime = job.EndTime.Sub(job.StartTime).Seconds()
-        } else {
-            totalExecutionTime = time.Since(job.StartTime).Seconds()
-        }
+			// Contadores por etapa (watermark) - incluye COMPLETADO_CON_ERRORES como completado
+			if img.WatermarkStatus == "COMPLETADO" || img.WatermarkStatus == "COMPLETADO_CON_ERRORES" {
+				watermarkCompleted++
+			} else if img.WatermarkStatus == "FALLIDO" {
+				watermarkFailed++
+			}
+		}
 
-        // Calcular porcentajes de éxito y fallo
-        var successPercentage, failurePercentage float64
-        if job.TotalFiles > 0 {
-            successPercentage = float64(job.ProcessedFiles) / float64(job.TotalFiles) * 100
-            failurePercentage = float64(job.FailedFiles) / float64(job.TotalFiles) * 100
-        }
+		// Calcular tiempo total de ejecución del job
+		var totalExecutionTime float64
+		if job.EndTime != nil {
+			totalExecutionTime = job.EndTime.Sub(job.StartTime).Seconds()
+		} else {
+			totalExecutionTime = time.Since(job.StartTime).Seconds()
+		}
 
-        // Calcular promedios por etapa (evitar división por cero)
-        downloadAvg := 0.0
-        if downloadCompleted > 0 {
-            downloadAvg = totalDownload / float64(downloadCompleted)
-        }
-        resizeAvg := 0.0
-        if resizeCompleted > 0 {
-            resizeAvg = totalResize / float64(resizeCompleted)
-        }
-        convertAvg := 0.0
-        if convertCompleted > 0 {
-            convertAvg = totalConvert / float64(convertCompleted)
-        }
-        watermarkAvg := 0.0
-        if watermarkCompleted > 0 {
-            watermarkAvg = totalWatermark / float64(watermarkCompleted)
-        }
+		// Calcular porcentajes de éxito y fallo
+		var successPercentage, failurePercentage float64
+		if job.TotalFiles > 0 {
+			successPercentage = float64(job.ProcessedFiles) / float64(job.TotalFiles) * 100
+			failurePercentage = float64(job.FailedFiles) / float64(job.TotalFiles) * 100
+		}
 
-        // Formatear la respuesta final
-        response := fiber.Map{
-            "job_info": job,
-            "global_metrics": fiber.Map{
-                "total_download_time_sec":  totalDownload,
-                "total_resize_time_sec":    totalResize,
-                "total_convert_time_sec":   totalConvert,
-                "total_watermark_time_sec": totalWatermark,
-                "total_execution_time_sec": totalExecutionTime,
-                "success_percentage":       successPercentage,
-                "failure_percentage":       failurePercentage,
-            },
-            "stage_metrics": fiber.Map{
-                "download": fiber.Map{
-                    "total_processed": downloadCompleted,
-                    "total_failed":    downloadFailed,
-                    "total_time_sec":  totalDownload,
-                    "avg_time_sec":    downloadAvg,
-                },
-                "resize": fiber.Map{
-                    "total_processed": resizeCompleted,
-                    "total_failed":    resizeFailed,
-                    "total_time_sec":  totalResize,
-                    "avg_time_sec":    resizeAvg,
-                },
-                "convert": fiber.Map{
-                    "total_processed": convertCompleted,
-                    "total_failed":    convertFailed,
-                    "total_time_sec":  totalConvert,
-                    "avg_time_sec":    convertAvg,
-                },
-                "watermark": fiber.Map{
-                    "total_processed": watermarkCompleted,
-                    "total_failed":    watermarkFailed,
-                    "total_time_sec":  totalWatermark,
-                    "avg_time_sec":    watermarkAvg,
-                },
-            },
-        }
+		// Calcular promedios por etapa (evitar división por cero)
+		downloadAvg := 0.0
+		if downloadCompleted > 0 {
+			downloadAvg = totalDownload / float64(downloadCompleted)
+		}
+		resizeAvg := 0.0
+		if resizeCompleted > 0 {
+			resizeAvg = totalResize / float64(resizeCompleted)
+		}
+		convertAvg := 0.0
+		if convertCompleted > 0 {
+			convertAvg = totalConvert / float64(convertCompleted)
+		}
+		watermarkAvg := 0.0
+		if watermarkCompleted > 0 {
+			watermarkAvg = totalWatermark / float64(watermarkCompleted)
+		}
 
-        return c.JSON(response)
-    })
+		// Formatear la respuesta final
+		response := fiber.Map{
+			"job_info": job,
+			"global_metrics": fiber.Map{
+				"total_download_time_sec":  totalDownload,
+				"total_resize_time_sec":    totalResize,
+				"total_convert_time_sec":   totalConvert,
+				"total_watermark_time_sec": totalWatermark,
+				"total_execution_time_sec": totalExecutionTime,
+				"success_percentage":       successPercentage,
+				"failure_percentage":       failurePercentage,
+			},
+			"stage_metrics": fiber.Map{
+				"download": fiber.Map{
+					"total_processed": downloadCompleted,
+					"total_failed":    downloadFailed,
+					"total_time_sec":  totalDownload,
+					"avg_time_sec":    downloadAvg,
+				},
+				"resize": fiber.Map{
+					"total_processed": resizeCompleted,
+					"total_failed":    resizeFailed,
+					"total_time_sec":  totalResize,
+					"avg_time_sec":    resizeAvg,
+				},
+				"convert": fiber.Map{
+					"total_processed": convertCompleted,
+					"total_failed":    convertFailed,
+					"total_time_sec":  totalConvert,
+					"avg_time_sec":    convertAvg,
+				},
+				"watermark": fiber.Map{
+					"total_processed": watermarkCompleted,
+					"total_failed":    watermarkFailed,
+					"total_time_sec":  totalWatermark,
+					"avg_time_sec":    watermarkAvg,
+				},
+			},
+		}
 
-    // 4. Iniciar servicio de lectura (Puerto distinto)
-    log.Println("Microservicio de Query iniciado en puerto 3001")
-    log.Fatal(app.Listen(":3001"))
+		return c.JSON(response)
+	})
+
+	// 4. Iniciar servicio de lectura (Puerto distinto)
+	log.Println("Microservicio de Query iniciado en puerto 3001")
+	log.Fatal(app.Listen(":3001"))
 }
