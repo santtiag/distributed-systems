@@ -1,0 +1,105 @@
+services:
+  # El Broker de Mensajería Global
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: broker_rabbitmq
+    ports:
+      - "5672:5672"   # Puerto de comunicación
+      - "15672:15672" # Interfaz gráfica de administración
+    healthcheck:
+      test: rabbitmq-diagnostics -q ping
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # INFO: Base de Datos exclusiva para el Servicio 1
+  db_pedidos:
+    image: postgres:15-alpine
+    container_name: db_pedidos
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: pedidos_db
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d pedidos_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Microservicio 1
+  servicio_pedidos:
+    build: .
+    container_name: api_pedidos
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://user:password@db_pedidos:5432/pedidos_db
+      - RABBITMQ_HOST=rabbitmq
+    depends_on:
+      db_pedidos:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  # INFO: Base de Datos exclusiva para el Servicio 2
+  db_facturacion:
+    image: postgres:15-alpine
+    container_name: db_facturacion
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: facturacion_db
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d facturacion_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Microservicio 2 - Facturación
+  servicio_facturacion:
+    build: ./servicio_2_facturacion
+    container_name: api_facturacion
+    ports:
+      - "8001:8000"
+    environment:
+      - DATABASE_URL=postgresql://user:password@db_facturacion:5432/facturacion_db
+      - RABBITMQ_HOST=rabbitmq
+    depends_on:
+      db_facturacion:
+        condition: service_healthy
+      rabbitmq:
+ 
+  # INFO: Base de Datos exclusiva para el Servicio 3
+  db_inventario:
+    image: postgres:15-alpine
+    container_name: db_inventario
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: inventario_db
+    ports:
+      - "5434:5432" # Puerto expuesto 5434 para evitar colisiones
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d inventario_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Microservicio 3 - Inventario
+  servicio_inventario:
+    build: ./servicio_3_inventario
+    container_name: api_inventario
+    ports:
+      - "8002:8000" # Expuesto en el puerto 8002
+    environment:
+      - DATABASE_URL=postgresql://user:password@db_inventario:5432/inventario_db
+      - RABBITMQ_HOST=rabbitmq
+    depends_on:
+      db_inventario:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy       condition: service_healthy
