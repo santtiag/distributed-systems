@@ -1,5 +1,4 @@
-from fastapi import FastAPI, Depends
-from sqlalchemy.orm import Session
+from fastapi import FastAPI
 import threading
 from . import models, database, rabbitmq
 
@@ -11,14 +10,6 @@ models.Base.metadata.create_all(bind=database.engine)
 def startup_event():
     hilo_consumidor = threading.Thread(target=rabbitmq.iniciar_consumidor, daemon=True)
     hilo_consumidor.start()
-
-# Endpoint administrativo para cargar inventario inicial
-# @app.post("/admin/productos/")
-# def crear_producto(producto: ProductoCreate, db: Session = Depends(database.get_db)):
-#     nuevo_producto = models.Producto(nombre=producto.nombre, stock=producto.stock)
-#     db.add(nuevo_producto)
-#     db.commit()
-#     return {"mensaje": "Producto creado", "producto": producto.nombre, "stock": producto.stock}
 
 @app.get("/health")
 def health_check():

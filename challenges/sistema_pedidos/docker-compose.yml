@@ -30,7 +30,7 @@ services:
 
   # Microservicio 1
   servicio_pedidos:
-    build: .
+    build: ./servicio_1_pedidos
     container_name: api_pedidos
     ports:
       - "8000:8000"
@@ -72,6 +72,7 @@ services:
       db_facturacion:
         condition: service_healthy
       rabbitmq:
+        condition: service_healthy
  
   # INFO: Base de Datos exclusiva para el Servicio 3
   db_inventario:
@@ -102,4 +103,37 @@ services:
       db_inventario:
         condition: service_healthy
       rabbitmq:
-        condition: service_healthy       condition: service_healthy
+        condition: service_healthy
+
+  # INFO: Base de Datos exclusiva para el Servicio 4
+  db_notificaciones:
+    image: postgres:15-alpine
+    container_name: db_notificaciones
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: notificaciones_db
+    ports:
+      - "5435:5432" # Expuesto en 5435
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d notificaciones_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Microservicio 4 - Notificaciones
+  servicio_notificaciones:
+    build: ./servicio_4_notificaciones
+    container_name: api_notificaciones
+    ports:
+      - "8003:8000" # Expuesto en el puerto 8003
+    environment:
+      - DATABASE_URL=postgresql://user:password@db_notificaciones:5432/notificaciones_db
+      - RABBITMQ_HOST=rabbitmq
+      - RESEND_API_KEY=${RESEND_API_KEY:-}
+      - EMAIL_FROM=${EMAIL_FROM:-onboarding@resend.dev}
+    depends_on:
+      db_notificaciones:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy

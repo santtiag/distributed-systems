@@ -17,16 +17,23 @@ def get_rabbitmq_connection():
             time.sleep(2)
     raise Exception("No se pudo conectar a RabbitMQ")
 
-def publicar_evento_facturacion(pedido_id: int, email: str, estado_pago: str):
+def publicar_evento_facturacion(pedido_id: int, cliente: str, email: str, producto: str,
+                                  cantidad: int, precio_total: float, estado_pago: str, monto: float):
     conexion = get_rabbitmq_connection()
     canal = conexion.channel()
     canal.queue_declare(queue='cola_facturacion', durable=True)
 
+    # Event-carried state transfer: reenviar todos los datos del pedido + datos de facturación
     evento = {
         "evento": "PagoProcesado",
         "pedido_id": pedido_id,
+        "cliente": cliente,
         "email": email,
-        "estado_pago": estado_pago
+        "producto": producto,
+        "cantidad": cantidad,
+        "precio_total": precio_total,
+        "estado_pago": estado_pago,
+        "monto": monto
     }
 
     canal.basic_publish(
@@ -37,16 +44,21 @@ def publicar_evento_facturacion(pedido_id: int, email: str, estado_pago: str):
     )
     conexion.close()
 
-def procesar_mensaje(ch, method, body):
+def procesar_mensaje(ch, method, properties, body):
     mensaje = json.loads(body)
     print(f"[*] Recibido pedido en Facturación: {mensaje}")
-    
-    properties = pika.BasicProperties(delivery_mode=2)
+
+    # Extraer todos los datos del evento (Event-carried state transfer)
     pedido_id = mensaje.get("pedido_id")
+    cliente = mensaje.get("cliente")
     email = mensaje.get("email")
-    
+    producto = mensaje.get("producto")
+    cantidad = mensaje.get("cantidad")
+    precio_total = mensaje.get("precio_total")
+
+    # Procesar pago
     estado_pago = "APROBADO"
-    monto = 100000.0 
+    monto = precio_total  # Usar el precio total del pedido
 
     db: Session = SessionLocal()
     try:
@@ -59,8 +71,18 @@ def procesar_mensaje(ch, method, body):
     finally:
         db.close()
 
-    publicar_evento_facturacion(pedido_id, email, estado_pago)
-    
+    # Reenviar todos los datos + información de facturación
+    publicar_evento_facturacion(
+        pedido_id=pedido_id,
+        cliente=cliente,
+        email=email,
+        producto=producto,
+        cantidad=cantidad,
+        precio_total=precio_total,
+        estado_pago=estado_pago,
+        monto=monto
+    )
+
     # Confirmar a RabbitMQ que el mensaje fue procesado (Acknowledge)
     ch.basic_ack(delivery_tag=method.delivery_tag)
     print(f"[*] Pago procesado y evento publicado para el pedido {pedido_id}")

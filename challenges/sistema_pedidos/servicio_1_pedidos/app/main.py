@@ -14,6 +14,13 @@ def crear_pedido(pedido: schemas.PedidoCreate, db: Session = Depends(database.ge
     db.commit()
     db.refresh(nuevo_pedido)
 
-    # 2. Publicar evento en RabbitMQ
-    rabbitmq.publicar_evento_pedido(nuevo_pedido.id, nuevo_pedido.cliente)
+    # 2. Publicar evento en RabbitMQ con Event-carried state transfer
+    rabbitmq.publicar_evento_pedido(
+        pedido_id=nuevo_pedido.id,
+        cliente=nuevo_pedido.cliente,
+        email=nuevo_pedido.email,
+        producto=nuevo_pedido.producto,
+        cantidad=nuevo_pedido.cantidad,
+        precio_total=nuevo_pedido.precio_total
+    )
     return nuevo_pedido
