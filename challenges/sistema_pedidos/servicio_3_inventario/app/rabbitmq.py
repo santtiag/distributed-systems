@@ -4,7 +4,7 @@ import os
 import time
 from sqlalchemy.orm import Session
 from .database import SessionLocal
-from .models import Producto
+from .models import Producto, ReservaInventario
 
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "rabbitmq")
 
@@ -58,41 +58,66 @@ def procesar_mensaje(ch, method, properties, body):
     estado_pago = mensaje.get("estado_pago")
 
     db: Session = SessionLocal()
-    estado_inventario = "RECHAZADO_SIN_STOCK"  # Asumimos lo peor inicialmente
 
     try:
-        # 1. Buscar el producto en la base de datos
+        # 1. VERIFICAR IDEMPOTENCIA: Si ya existe una reserva para este pedido, ignorar
+        reserva_existente = db.query(ReservaInventario).filter(ReservaInventario.pedido_id == pedido_id).first()
+        if reserva_existente:
+            print(f"[!] Pedido {pedido_id} ya fue procesado en Inventario. Mensaje duplicado ignorado.")
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            db.close()
+            return
+
+        estado_inventario = None
+
+        # 2. Buscar el producto en la base de datos
         producto = db.query(Producto).filter(Producto.nombre == producto_nombre).first()
 
-        # 2. Validar stock y actualizar
-        if producto and producto.stock >= cantidad_requerida:
+        # 3. Validar existencia y stock
+        if not producto:
+            estado_inventario = "PRODUCTO_NO_ENCONTRADO"
+            print(f"[X] Producto {producto_nombre} no encontrado en la base de datos.")
+        elif producto.stock >= cantidad_requerida:
             producto.stock -= cantidad_requerida
             estado_inventario = "RESERVADO"
             db.commit()
             print(f"[✓] Stock reservado para {producto_nombre}. Stock restante: {producto.stock}")
         else:
+            estado_inventario = "RECHAZADO_SIN_STOCK"
             print(f"[X] No hay stock suficiente para {producto_nombre}.")
 
+        # 4. Registrar la reserva (para idempotencia)
+        nueva_reserva = ReservaInventario(
+            pedido_id=pedido_id,
+            producto_nombre=producto_nombre,
+            cantidad=cantidad_requerida,
+            estado=estado_inventario
+        )
+        db.add(nueva_reserva)
+        db.commit()
+
+        # 5. Publicar el evento con todos los datos para el Servicio 4 (Notificaciones)
+        publicar_evento_inventario(
+            pedido_id=pedido_id,
+            cliente=cliente,
+            email=email,
+            producto=producto_nombre,
+            cantidad=cantidad_requerida,
+            precio_total=precio_total,
+            estado_pago=estado_pago,
+            estado_inventario=estado_inventario
+        )
+
+        # 6. Confirmar procesamiento a RabbitMQ
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+
     except Exception as e:
-        print(f"Error en BD: {e}")
+        print(f"[X] Error en BD: {e}")
         db.rollback()
+        # Hacer ACK para evitar loops infinitos en caso de error de datos duplicados
+        ch.basic_ack(delivery_tag=method.delivery_tag)
     finally:
         db.close()
-
-    # 3. Publicar el evento con todos los datos para el Servicio 4 (Notificaciones)
-    publicar_evento_inventario(
-        pedido_id=pedido_id,
-        cliente=cliente,
-        email=email,
-        producto=producto_nombre,
-        cantidad=cantidad_requerida,
-        precio_total=precio_total,
-        estado_pago=estado_pago,
-        estado_inventario=estado_inventario
-    )
-
-    # 4. Confirmar procesamiento a RabbitMQ
-    ch.basic_ack(delivery_tag=method.delivery_tag)
 
 def iniciar_consumidor():
     conexion = get_rabbitmq_connection()

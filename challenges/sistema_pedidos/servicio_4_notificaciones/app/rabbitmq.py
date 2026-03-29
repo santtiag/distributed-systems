@@ -10,7 +10,6 @@ RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "rabbitmq")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 EMAIL_FROM = os.getenv("EMAIL_FROM", "onboarding@resend.dev")
 
-# Intentar configurar Resend si hay API key
 try:
     import resend
     if RESEND_API_KEY:
@@ -146,29 +145,41 @@ def procesar_mensaje(ch, method, properties, body):
     estado_pago = mensaje_broker.get("estado_pago")
     estado_inventario = mensaje_broker.get("estado_inventario")
 
-    # 1. Determinar el estado final y el mensaje basado en el inventario
-    if estado_inventario == "RESERVADO":
-        estado_final = "COMPLETADO"
-        cuerpo_mensaje = f"¡Buenas noticias {cliente}! Tu pago fue aprobado, confirmamos stock de {producto} y tu pedido está siendo preparado para el envío."
-    else:
-        estado_final = "CANCELADO_SIN_STOCK"
-        cuerpo_mensaje = f"Lo sentimos {cliente}. Tu pago fue procesado, pero no tenemos stock disponible de {producto}. Iniciaremos el proceso de reembolso a la brevedad."
-
-    # 2. "Enviar" el correo con información completa (usando Resend o simulación)
-    enviar_notificacion_email(
-        email=email,
-        pedido_id=pedido_id,
-        cliente=cliente,
-        producto=producto,
-        cantidad=cantidad,
-        precio_total=precio_total,
-        estado=estado_final,
-        mensaje=cuerpo_mensaje
-    )
-
-    # 3. Registrar el evento final en la base de datos
     db: Session = SessionLocal()
+
     try:
+        # 1. VERIFICAR IDEMPOTENCIA: Si ya existe una notificación para este pedido, ignorar
+        notificacion_existente = db.query(Notificacion).filter(Notificacion.pedido_id == pedido_id).first()
+        if notificacion_existente:
+            print(f"[!] Pedido {pedido_id} ya fue notificado. Mensaje duplicado ignorado.")
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            db.close()
+            return
+
+        # 2. Determinar el estado final y el mensaje basado en el inventario
+        if estado_inventario == "RESERVADO":
+            estado_final = "COMPLETADO"
+            cuerpo_mensaje = f"¡Buenas noticias {cliente}! Tu pago fue aprobado, confirmamos stock de {producto} y tu pedido está siendo preparado para el envío."
+        elif estado_inventario == "PRODUCTO_NO_ENCONTRADO":
+            estado_final = "CANCELADO_PRODUCTO_NO_DISPONIBLE"
+            cuerpo_mensaje = f"Lo sentimos {cliente}. Tu pago fue procesado, pero el producto '{producto}' no está disponible en nuestro catálogo. Iniciaremos el proceso de reembolso a la brevedad."
+        else:  # RECHAZADO_SIN_STOCK
+            estado_final = "CANCELADO_SIN_STOCK"
+            cuerpo_mensaje = f"Lo sentimos {cliente}. Tu pago fue procesado, pero no tenemos stock disponible de {producto}. Iniciaremos el proceso de reembolso a la brevedad."
+
+        # 3. Enviar el correo con información completa (usando Resend o simulación)
+        enviar_notificacion_email(
+            email=email,
+            pedido_id=pedido_id,
+            cliente=cliente,
+            producto=producto,
+            cantidad=cantidad,
+            precio_total=precio_total,
+            estado=estado_final,
+            mensaje=cuerpo_mensaje
+        )
+
+        # 4. Registrar el evento final en la base de datos
         nueva_notificacion = Notificacion(
             pedido_id=pedido_id,
             email_cliente=email,
@@ -178,14 +189,17 @@ def procesar_mensaje(ch, method, properties, body):
         db.add(nueva_notificacion)
         db.commit()
         print(f"[✓] Registro de notificación guardado en BD para el pedido {pedido_id}")
+
+        # 5. Confirmar procesamiento a RabbitMQ
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+
     except Exception as e:
-        print(f"Error en BD: {e}")
+        print(f"[X] Error en BD: {e}")
         db.rollback()
+        # Hacer ACK para evitar loops infinitos en caso de error de datos duplicados
+        ch.basic_ack(delivery_tag=method.delivery_tag)
     finally:
         db.close()
-
-    # 4. Confirmar procesamiento a RabbitMQ
-    ch.basic_ack(delivery_tag=method.delivery_tag)
 
 def iniciar_consumidor():
     conexion = get_rabbitmq_connection()

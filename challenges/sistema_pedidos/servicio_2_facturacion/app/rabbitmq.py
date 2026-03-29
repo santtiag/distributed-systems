@@ -56,36 +56,51 @@ def procesar_mensaje(ch, method, properties, body):
     cantidad = mensaje.get("cantidad")
     precio_total = mensaje.get("precio_total")
 
-    # Procesar pago
-    estado_pago = "APROBADO"
-    monto = precio_total  # Usar el precio total del pedido
-
     db: Session = SessionLocal()
     try:
+        # 1. VERIFICAR IDEMPOTENCIA: Si ya existe una factura para este pedido, ignorar
+        factura_existente = db.query(Factura).filter(Factura.pedido_id == pedido_id).first()
+        if factura_existente:
+            print(f"[!] Pedido {pedido_id} ya fue facturado (Factura ID: {factura_existente.id}). Mensaje duplicado ignorado.")
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            return
+
+        # 2. Procesar pago
+        estado_pago = "APROBADO"
+        monto = precio_total  # Usar el precio total del pedido
+
+        # 3. Guardar en BD primero (para validar idempotencia)
         nueva_factura = Factura(pedido_id=pedido_id, monto=monto, estado_pago=estado_pago)
         db.add(nueva_factura)
         db.commit()
+        print(f"[✓] Factura creada para pedido {pedido_id} - Monto: {monto}")
+
+        # 4. Solo publicar evento si el guardado fue exitoso
+        publicar_evento_facturacion(
+            pedido_id=pedido_id,
+            cliente=cliente,
+            email=email,
+            producto=producto,
+            cantidad=cantidad,
+            precio_total=precio_total,
+            estado_pago=estado_pago,
+            monto=monto
+        )
+
+        # 5. Confirmar a RabbitMQ que el mensaje fue procesado (Acknowledge)
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+        print(f"[*] Pago procesado y evento publicado para el pedido {pedido_id}")
+
     except Exception as e:
-        print(f"Error en BD: {e}")
+        print(f"[X] Error en BD: {e}")
         db.rollback()
+        # No hacer ACK en caso de error - el mensaje será reencolado
+        # Pero para mensajes duplicados con IntegrityError, el try-catch anterior ya lo maneja
+        # Si llegamos aquí con IntegrityError, es una condición de carrera rara
+        # Hacemos ACK para evitar loops infinitos
+        ch.basic_ack(delivery_tag=method.delivery_tag)
     finally:
         db.close()
-
-    # Reenviar todos los datos + información de facturación
-    publicar_evento_facturacion(
-        pedido_id=pedido_id,
-        cliente=cliente,
-        email=email,
-        producto=producto,
-        cantidad=cantidad,
-        precio_total=precio_total,
-        estado_pago=estado_pago,
-        monto=monto
-    )
-
-    # Confirmar a RabbitMQ que el mensaje fue procesado (Acknowledge)
-    ch.basic_ack(delivery_tag=method.delivery_tag)
-    print(f"[*] Pago procesado y evento publicado para el pedido {pedido_id}")
 
 def iniciar_consumidor():
     conexion = get_rabbitmq_connection()
